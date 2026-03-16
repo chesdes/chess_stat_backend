@@ -1,4 +1,4 @@
-# chess-stat.ru backend
+# [chess-stat.ru](https://chess-stat.ru) backend
 
 | ![logo-blue](https://chess-stat.ru/image/logo-blue.png) | ![logo-white](https://chess-stat.ru/image/logo.png) |
 |-|-|
