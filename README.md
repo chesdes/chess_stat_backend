@@ -1,5 +1,10 @@
 # chess-stat.ru backend
 
-<img src=https://chess-stat.ru/image/logo-blue.png max-width=70% width=300px algin=center/>
+| ![logo-blue](https://chess-stat.ru/image/logo-blue.png) | ![logo-white](https://chess-stat.ru/image/logo.png) |
+|-|-|
 
-### backend part of my project chess-stat.ru with chess stats and analytics.
+---
+
+### backend part of my project chess-stat.ru with chess stats and analytics. Made on FastAPI. Uses Redis to cache game analysis. 
+  
+### [API DOCS](https://chess-stat.ru/api/docs)
