@@ -8,3 +8,5 @@
 ### backend part of my project chess-stat.ru with chess stats and analytics. Made on FastAPI. Uses Redis to cache game analysis. 
   
 ### [API DOCS](https://chess-stat.ru/api/docs)
+
+More information in the future, as the project develops
