@@ -76,7 +76,7 @@ async def get_last_game_analyze(site: str, username: str, index: int):
         if cache:
             try:
                 res = json.loads(cache)
-                return {"game": game, "analyze": json.loads(cache)} 
+                return {"game": game, "analyze": res} 
             except:
                 return {"game": game, "analyze": cache} 
         await redis.set(f"analyze:{site}:{game.url.split('/')[-1]}", "in progress", ex=259200)
