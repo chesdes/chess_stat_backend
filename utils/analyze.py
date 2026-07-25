@@ -65,6 +65,7 @@ class Analyzer:
         last_expected = None
         accuracy_list = [[100.0], [100.0]]
         last_chesscom_classify = None
+        last_diff = None
         move_index = 0
         cps = []
         for move in game.mainline_moves():
@@ -82,6 +83,9 @@ class Analyzer:
                 diff = abs(last_expected - expected_score) if last_expected is not None else 0 
             else:
                 diff = 0
+
+            chess_stat_classify = self._get_chess_stat_move_classifies(diff, move_index, uci, opening, 
+                                                                       best_move, last_diff)
             chesscom_classify = self._get_chesscom_move_classifies(
                                                                 diff, move_index, uci, opening, best_move,
                                                                 last_chesscom_classify, whiteElo, blackElo, cps, 
@@ -107,17 +111,38 @@ class Analyzer:
                 "accuracy": round(average_accuracy, 1),
                 "diff_expected": diff,
                 "move_classify": {
-                    "chesscom": chesscom_classify
+                    "chesscom": chesscom_classify,
+                    "chess_stat": chess_stat_classify
                 }
             })
 
             last_win_precent = win_precent
             last_chesscom_classify = chesscom_classify
+            last_diff = diff
             last_expected = expected_score
             cps.append(info['value']) if info['type'] != "mate" else cps.append(cps[-2]) if len(cps) >= 2 else cps.append(cpawns)
             move_index += 1
 
         return results
+    
+    def _get_chess_stat_move_classifies(self, diff: float, move_index: int, 
+                                      uci: str, opening: list[str], best_move: str,
+                                      last_diff: float):
+        if uci == best_move or diff <= 0.02:
+            move_classify = "advance"
+        elif diff <= 0.07:
+            move_classify = "steady"
+        else:
+            if last_diff and last_diff >= 0.12 and diff >= 0.09:
+                move_classify = "miss"
+            else:
+                move_classify = "retreat"
+
+        if (move_index < len(opening["moves"]) and uci == opening["moves"][move_index]):
+            move_classify = "theory"
+
+        return move_classify
+
 
     def _get_chesscom_move_classifies(self, diff: float, move_index: int, 
                                       uci: str, opening: list[str], best_move: str,
