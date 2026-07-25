@@ -128,12 +128,12 @@ class Analyzer:
     def _get_chess_stat_move_classifies(self, diff: float, move_index: int, 
                                       uci: str, opening: list[str], best_move: str,
                                       last_diff: float):
-        if uci == best_move or diff <= 0.02:
+        if uci == best_move or diff <= 0.04:
             move_classify = "advance"
-        elif diff <= 0.07:
+        elif diff <= 0.12:
             move_classify = "steady"
         else:
-            if last_diff and last_diff >= 0.12 and diff >= 0.09:
+            if last_diff and last_diff > 0.12 and diff >= 0.09:
                 move_classify = "miss"
             else:
                 move_classify = "retreat"
