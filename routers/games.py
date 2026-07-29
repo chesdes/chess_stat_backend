@@ -7,7 +7,7 @@ router = APIRouter(
 )
     
 @router.get("/last/{site}/{username}/{amount}")
-async def get_last_game_analyze(site: str, username: str, amount: int):
+async def get_last_games(site: str, username: str, amount: int):
     try:
         parser = get_parser(site=site)
         games = await parser.get_last_games(username=username, limit=amount)
