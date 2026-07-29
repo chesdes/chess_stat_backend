@@ -14,3 +14,7 @@ class MoveResult(BaseModel):
 
 class AnalyzePayload(BaseModel):
     results: List[MoveResult]
+
+class AnalyzeAndPgnPayload(BaseModel):
+    pgn: str
+    results: List[MoveResult]

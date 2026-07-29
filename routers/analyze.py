@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from parsers import get_parser
 from utils import Analyzer, RedisClient
-from models import AnalyzePayload
+from models import AnalyzePayload, AnalyzeAndPgnPayload
 import json
 import asyncio
 
@@ -45,3 +45,13 @@ async def save_last_game_analyze(site: str, username: str, index: int, payload: 
         return {"game": game, "analyze": result}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/pgn")
+async def get_pgn_analyze_classifications(payload: AnalyzeAndPgnPayload):
+    try:
+        analyze = Analyzer()
+        game_analyze = [res.model_dump() for res in payload.results]
+        result = await asyncio.to_thread(analyze.calculate_info, game_analyze, payload.pgn)
+        return {"analyze": result}
+    except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
