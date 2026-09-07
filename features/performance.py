@@ -6,22 +6,23 @@ async def get_performance_of_last_games(site: str, username: str, games: int, co
     username = username.lower()
     parser = get_parser(site)
     games_list = await parser.get_last_games(username=username, limit=games, control=control)
-    return get_performance(games=games_list, username=username)
+    return await get_performance(games=games_list, username=username)
 
 async def get_performance_of_last_months(site: str, username: str, months: int, control: str | None = None) -> int:
     username = username.lower()
     parser = get_parser(site)
     cur_month = datetime.today().month
     cur_year = datetime.today().year
+    games_list = []
 
-    for i in range(months):
-        games_list += await parser.get_month_games(username,cur_year,cur_month,control)
+    for _ in range(months):
+        games_list += await parser.get_month_games(username, cur_year, cur_month, control)
         if cur_month > 1:
             cur_month -= 1
         else:
             cur_month = 12
             cur_year -= 1
-    return get_performance(games=games_list, username=username)
+    return await get_performance(games=games_list, username=username)
 
 async def get_performance(games: list[Game], username: str):
     username = username.lower()
@@ -33,11 +34,13 @@ async def get_performance(games: list[Game], username: str):
             match i.white.result:
                 case "win": score += 1
                 case "loss": score += 0.5
+                case "draw": score += 0.5
         elif i.black.username.lower() == username:
             ops.append(i.white.rating)
             match i.black.result:
                 case "win": score += 1
                 case "loss": score += 0.5
+                case "draw": score += 0.5
     return _performance_rating(ops, score)
 
 def _expected_score(opponent_ratings: list[float], own_rating: float) -> float:

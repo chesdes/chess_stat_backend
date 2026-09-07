@@ -2,7 +2,6 @@ from datetime import datetime, timezone, timedelta
 from models import PlayerProfile, Game, Player, Stats, TimeControl
 from utils import get_json
 from .base_parser import BaseParser
-import calendar
 import asyncio
 
 BASE_URL = "https://api.chess.com/pub/player"
@@ -62,13 +61,14 @@ class ChessComParser(BaseParser):
     async def _get_stats(self, username: str) -> dict:
         return await get_json(f"{BASE_URL}/{username}/stats") or {}
 
-    async def get_last_games(self, username: str, limit: int = 100, control: str | None = None) -> list[Game]:
+    async def get_last_games(self, username: str, limit: int = 100, offset: int = 0, control: str | None = None) -> list[Game]:
         archives = await get_json(f"{BASE_URL}/{username}/games/archives")
         if not archives:
             raise ValueError("archives empty")
 
         urls = reversed(archives.get("archives", []))
         all_games = []
+        skipped_games = 0
 
         for url in urls:
             data = await get_json(url)
@@ -77,6 +77,10 @@ class ChessComParser(BaseParser):
 
             for g in reversed(data.get("games", [])):
                 if control and g.get("time_class") != control:
+                    continue
+
+                if skipped_games < offset:
+                    skipped_games += 1
                     continue
 
                 all_games.append(self._map_game(g))
@@ -129,8 +133,10 @@ class ChessComParser(BaseParser):
         while current <= end_dt+timedelta(days=1):
             url = f"{BASE_URL}/{username}/games/{current.year}/{current.month:02d}"
             tasks.append(get_json(url))
-            days_in_month = calendar.monthrange(current.year, current.month)[1]
-            current += timedelta(days=days_in_month)
+            if current.month == 12:
+                current = datetime(current.year + 1, 1, 1, tzinfo=timezone.utc)
+            else:
+                current = datetime(current.year, current.month + 1, 1, tzinfo=timezone.utc)
 
         results = await asyncio.gather(*tasks)
 

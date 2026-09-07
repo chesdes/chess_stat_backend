@@ -49,10 +49,20 @@ class Analyzer:
 
     def calculate_info(self, analyze: list[dict], pgn_text: str) -> list[dict]:
         game = chess.pgn.read_game(StringIO(pgn_text))
-        whiteElo = int(game.headers["WhiteElo"])
-        blackElo = int(game.headers["BlackElo"])
         if not game:
             raise ValueError("Failed to parse PGN text.")
+
+        try:
+            whiteElo = int(game.headers.get("WhiteElo", 0) or 0)
+            blackElo = int(game.headers.get("BlackElo", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("PGN ratings must be integers.") from exc
+
+        moves = list(game.mainline_moves())
+        if not moves:
+            raise ValueError("PGN must contain at least one move.")
+        if len(analyze) != len(moves):
+            raise ValueError("Analysis result count must match the number of PGN moves.")
 
         if game.board() == chess.Board():
             last_win_precent = 50
@@ -68,7 +78,7 @@ class Analyzer:
         last_diff = None
         move_index = 0
         cps = []
-        for move in game.mainline_moves():
+        for move in moves:
             uci = move.uci()
             is_sacrifice = self._is_sacrifice(move, board)
             board.push(move)

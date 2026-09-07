@@ -9,7 +9,7 @@ class BaseParser(ABC):
         pass
 
     @abstractmethod
-    async def get_last_games(self, username: str, limit: int = 100, control: str | None = None) -> list[Game]:
+    async def get_last_games(self, username: str, limit: int = 100, offset: int = 0, control: str | None = None) -> list[Game]:
         pass
 
     @abstractmethod

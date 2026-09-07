@@ -15,3 +15,10 @@ class Game(BaseModel):
     pgn: str
     time_control: str | None = None
     url: str | None = None
+
+class GamesPage(BaseModel):
+    games: list[Game]
+    offset: int
+    limit: int
+    total_pages: int
+    has_more: bool
