@@ -26,7 +26,7 @@ class Analyzer:
         with analysis_semaphore:
             results = []
             engine = Stockfish(
-                path="/usr/games/stockfish",
+                path="/usr/local/bin/stockfish",
                 depth=self.depth,
                 parameters={"Threads": 1}
             )
