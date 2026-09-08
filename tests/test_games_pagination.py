@@ -36,9 +36,8 @@ class GamesPaginationTests(unittest.TestCase):
         end = int(datetime(2024, 3, 1, tzinfo=timezone.utc).timestamp())
 
         async def run(mock_get_json):
-            with self.assertRaises(ValueError):
-                await ChessComParser().get_games_in_period("player", start, end)
-            return [call.args[0] for call in mock_get_json.call_args_list]
+            result = await ChessComParser().get_games_in_period("player", start, end)
+            return result, [call.args[0] for call in mock_get_json.call_args_list]
 
         mock_get_json = AsyncMock(return_value={"games": []})
 
@@ -46,7 +45,9 @@ class GamesPaginationTests(unittest.TestCase):
             with patch("parsers.chesscom.get_json", new=mock_get_json):
                 return await run(mock_get_json)
 
-        urls = asyncio.run(collect_urls())
+        result, urls = asyncio.run(collect_urls())
+
+        self.assertEqual(result, [])
 
         self.assertEqual(
             urls,

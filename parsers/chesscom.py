@@ -147,9 +147,6 @@ class ChessComParser(BaseParser):
                 if start <= g.get("end_time", 0) < end and (control is None or g.get("time_class") == control):
                     games.append(self._map_game(g))
 
-        if not games:
-            raise ValueError("games array is null")
-
         return games
 
     def _map_game(self, g: dict) -> Game:
