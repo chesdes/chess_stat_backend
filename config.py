@@ -1,3 +1,4 @@
+import hashlib
 import os
 
 
@@ -24,3 +25,19 @@ CORS_ORIGINS = tuple(
     ).split(",")
     if origin.strip()
 )
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+ADMIN_TOKEN_TTL_SECONDS = _get_int("ADMIN_TOKEN_TTL_SECONDS", 86_400, 300, 604_800)
+ADMIN_SECRET = os.getenv("ADMIN_SECRET") or (
+    hashlib.sha256(f"chess-stat-admin:{ADMIN_PASSWORD}".encode()).hexdigest()
+    if ADMIN_PASSWORD
+    else ""
+)
+
+STATS_IP_SALT = os.getenv("STATS_IP_SALT", "")
+STATS_RETENTION_DAYS = _get_int("STATS_RETENTION_DAYS", 400, 7, 3650)
+
+ADMIN_MAX_ATTEMPTS = _get_int("ADMIN_MAX_ATTEMPTS", 5, 1, 100)
+ADMIN_BAN_SECONDS = _get_int("ADMIN_BAN_SECONDS", 1800, 60, 86400)

@@ -20,5 +20,8 @@ class GamesPage(BaseModel):
     games: list[Game]
     offset: int
     limit: int
-    total_pages: int
+    # Exact page count is known only once the last page is reached
+    # (has_more=False); otherwise None — the backend never scans the full
+    # archive history just to count games.
+    total_pages: int | None
     has_more: bool

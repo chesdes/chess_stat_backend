@@ -1,6 +1,11 @@
 from abc import ABC, abstractmethod
 from models import PlayerProfile, Game
 
+
+class PlayerNotFoundError(ValueError):
+    """The chess site has no such player (its API answered 404)."""
+
+
 class BaseParser(ABC):
     site: str
 

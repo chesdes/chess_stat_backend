@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from services import ProfileService
 from models import PlayerProfile
+from parsers import PlayerNotFoundError
 from utils import UpstreamError
 import logging
 
@@ -27,6 +28,8 @@ async def get_profile(
         return await profile_service.get_profile(site, username)
     except UpstreamError:
         raise
+    except PlayerNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Player not found") from exc
     except Exception:
         logger.exception("Failed to load profile")
         raise HTTPException(status_code=404, detail="Unable to load profile")

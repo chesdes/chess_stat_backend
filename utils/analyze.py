@@ -180,8 +180,9 @@ class Analyzer:
                 or (all_cpawns[-2] > cpawns and move_index % 2 == 1))):
             move_classify = "great"
 
-        if is_sacrifice and uci == best_move and ((all_cpawns[-2] <= cpawns and move_index % 2 == 0) 
-                or (all_cpawns[-2] >= cpawns and move_index % 2 == 1)):
+        if (is_sacrifice and uci == best_move and len(all_cpawns) >= 2
+            and ((all_cpawns[-2] <= cpawns and move_index % 2 == 0)
+                 or (all_cpawns[-2] >= cpawns and move_index % 2 == 1))):
             move_classify = "brilliant"
 
         if last_classify and last_classify == "blunder" and move_classify == "blunder":

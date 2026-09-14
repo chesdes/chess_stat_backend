@@ -12,9 +12,13 @@ class UpstreamError(Exception):
     pass
 
 class UpstreamHTTPError(UpstreamError):
-    def __init__(self, status_code: int):
+    def __init__(self, status_code: int, url: str | None = None):
         self.status_code = status_code
-        super().__init__(f"Upstream request failed with status {status_code}")
+        self.url = url
+        super().__init__(
+            f"Upstream request failed with status {status_code}"
+            + (f": {url}" if url else "")
+        )
 
 class UpstreamUnavailableError(UpstreamError):
     pass
@@ -45,7 +49,7 @@ async def get_json(url: str, headers: dict | None = None, timeout: int = 10):
                 return await response.json()
         except aiohttp.ClientResponseError as e:
             if e.status not in RETRYABLE_STATUS_CODES or attempt == MAX_RETRIES:
-                raise UpstreamHTTPError(e.status) from e
+                raise UpstreamHTTPError(e.status, url) from e
             logger.warning("Retrying upstream request after HTTP %s: %s", e.status, url)
             await asyncio.sleep(RETRY_DELAYS[attempt])
         except asyncio.TimeoutError as e:

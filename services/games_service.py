@@ -16,12 +16,18 @@ class GamesService:
             limit=limit + 1,
             offset=offset,
         )
+        has_more = len(games) > limit and offset + limit < MAX_GAMES
+        if has_more:
+            total_pages = None
+        else:
+            # Last page reached: the true total is offset + games on it.
+            total_pages = max(1, math.ceil((offset + len(games[:limit])) / limit))
         return GamesPage(
             games=games[:limit],
             offset=offset,
             limit=limit,
-            total_pages=math.ceil(MAX_GAMES / limit),
-            has_more=len(games) > limit and offset + limit < MAX_GAMES,
+            total_pages=total_pages,
+            has_more=has_more,
         )
 
     @staticmethod

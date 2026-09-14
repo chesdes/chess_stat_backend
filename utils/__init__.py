@@ -7,6 +7,7 @@ from .http_client import (
 	init_http_client,
 )
 from .analyze import Analyzer
+from .visitor_names import visitor_name
 from .openings import find_closest_opening
 from .redis_client import RedisClient
 
@@ -18,6 +19,7 @@ __all__ = [
 	"get_json",
 	"init_http_client",
 	"Analyzer",
+	"visitor_name",
 	"find_closest_opening",
 	"RedisClient",
 ]

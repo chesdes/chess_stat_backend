@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Path, Query
 from models import Game, GamesPage
+from parsers import PlayerNotFoundError
 from config import MAX_GAMES, MAX_PAGE_OFFSET, MAX_PAGE_SIZE
 from services import GamesService
 from utils import UpstreamError
@@ -30,6 +31,8 @@ async def get_last_games(
         return await games_service.get_last_games(site, username, amount)
     except UpstreamError:
         raise
+    except PlayerNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Player not found") from exc
     except Exception:
         logger.exception("Failed to load games")
         raise HTTPException(status_code=404, detail="Unable to load games")
@@ -51,6 +54,8 @@ async def get_games_page(
         return await games_service.get_games_page(site, username, limit, offset)
     except UpstreamError:
         raise
+    except PlayerNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Player not found") from exc
     except Exception:
         logger.exception("Failed to load games page")
         raise HTTPException(status_code=404, detail="Unable to load games page")

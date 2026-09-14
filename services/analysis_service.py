@@ -4,6 +4,7 @@ import json
 from config import ANALYSIS_CONCURRENCY
 from models import AnalyzePayload, AnalyzeAndPgnPayload
 from parsers import get_parser
+from starlette.requests import Request
 from utils import Analyzer, RedisClient
 
 
@@ -22,7 +23,13 @@ class AnalysisService:
         self.analyzer = analyzer or Analyzer()
         self.analysis_semaphore = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
 
-    async def get_last_game_analysis(self, site: str, username: str, index: int):
+    async def get_last_game_analysis(
+        self,
+        site: str,
+        username: str,
+        index: int,
+        request: Request | None = None,
+    ):
         parser = self._get_parser(site)
         games = await parser.get_last_games(username=username, limit=index)
         game = self._last_game(games)
@@ -34,13 +41,23 @@ class AnalysisService:
             try:
                 result = json.loads(cache)
                 if isinstance(result, (dict, list)):
+                    moves = len(result) if isinstance(result, list) else None
+                    self._set_stats_state(request, cache_hit=True, moves_count=moves)
                     return {"game": game, "analyze": result}
             except json.JSONDecodeError:
                 pass
 
+        self._set_stats_state(request, cache_hit=False)
         return {"game": game, "analyze": None}
 
-    async def save_last_game_analysis(self, site: str, username: str, index: int, payload: AnalyzePayload):
+    async def save_last_game_analysis(
+        self,
+        site: str,
+        username: str,
+        index: int,
+        payload: AnalyzePayload,
+        request: Request | None = None,
+    ):
         parser = self._get_parser(site)
         games = await parser.get_last_games(username=username, limit=index)
         game = self._last_game(games)
@@ -48,6 +65,7 @@ class AnalysisService:
             [item.model_dump() for item in payload.results],
             game.pgn,
         )
+        self._set_stats_state(request, cache_hit=False, moves_count=len(result))
 
         redis = RedisClient.get_client()
         await redis.set(
@@ -57,12 +75,25 @@ class AnalysisService:
         )
         return {"game": game, "analyze": result}
 
-    async def analyze_pgn(self, payload: AnalyzeAndPgnPayload):
+    async def analyze_pgn(
+        self,
+        payload: AnalyzeAndPgnPayload,
+        request: Request | None = None,
+    ):
         result = await self._calculate(
             [item.model_dump() for item in payload.results],
             payload.pgn,
         )
+        self._set_stats_state(request, cache_hit=False, moves_count=len(result))
         return {"analyze": result}
+
+    @staticmethod
+    def _set_stats_state(request: Request | None, cache_hit: bool, moves_count: int | None = None) -> None:
+        if request is None:
+            return
+        request.state.analysis_cache_hit = cache_hit
+        if moves_count is not None:
+            request.state.analysis_moves_count = moves_count
 
     async def _calculate(self, results: list[dict], pgn: str):
         if self.analysis_semaphore.locked():
