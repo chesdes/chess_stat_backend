@@ -85,7 +85,7 @@ Running Stockfish is expensive, so this API does **not** run a chess engine itse
 
 1. The client (browser) runs Stockfish locally over a game's moves and produces one evaluation (`{type, value}`) plus a `best_move` per ply.
 2. The client sends those precomputed results to `POST /analyze/pgn` or `POST /analyze/last/{site}/{username}/{index}`.
-3. The server turns raw evaluations into per-move **classifications** (best / excellent / good / inaccuracy / mistake / blunder / great / brilliant / miss / theory, plus chess-stat.ru's own `chess_stat` classifier), an **accuracy** score, and **opening** detection — and caches the result in Redis for game-analysis endpoints.
+3. The server turns raw evaluations into per-move **classifications** (best / excellent / good / inaccuracy / mistake / blunder / great / brilliant / miss / theory, plus chess-stat.ru's own `chess_stat` classifier), an **accuracy** score, an **efficiency** score (see below), and **opening** detection — and caches the result in Redis for game-analysis endpoints.
 
 ### Move classification systems
 
@@ -97,6 +97,19 @@ Two parallel classifiers are returned per move under `move_classify`:
 ### Opening detection
 
 The first move sequence of a game is matched against an ECO opening database (categories A–E) to detect the opening name and mark "theory" moves that match known opening lines.
+
+### Efficiency: who is playing better *right now*
+
+Engine evaluation alone doesn't tell you who currently has the initiative — it only tells you who stands better. Two players can reach the exact same position through very different paths: one confidently and quickly, the other barely holding on and burning their clock to survive. `efficiency` is built to surface that difference.
+
+For each move, efficiency combines two things:
+
+- **Move quality** — how close the move was to the best move (`diff_expected`, i.e. the same expected-score delta used for classification), so an inaccurate move is immediately penalized regardless of how fast it was played.
+- **Time spent** — the move's time cost relative to the base time control (`move_time / time_before`, capped so extreme outliers don't dominate), so a "correct" move that took forever to find is still scored as a weaker moment for that player.
+
+These are combined into a single per-move score in `[0, 100]`, then smoothed into `eff_white` / `eff_black`: a rolling average over each side's last **3** moves (`EFF_WINDOW_PER_SIDE`), so the number reflects *recent form in the position*, not a single lucky or unlucky move. `efficiency` requires a clock in the PGN (`[%clk ...]` annotations); without clock data it — and `eff_white`/`eff_black` — is `null`.
+
+**Reading it as an eval bar:** plotting `eff_white` against `eff_black` over the course of a game gives a second bar alongside the engine evaluation bar. The engine bar says who's ahead; the efficiency bar says who's currently under pressure. A telling pattern: White is worse by engine evaluation, but Black — despite standing better — is burning large amounts of time each move (the position is hard, Black doesn't yet feel the win), while White responds quickly and accurately. Here White's efficiency is higher than Black's even though White's evaluation is lower — a signal that Black is more likely to err as the position continues, and White has a realistic practical path back into (or to) a winning position.
 
 ---
 
@@ -285,6 +298,7 @@ Classify an arbitrary PGN (not tied to a specific site/player) using client-supp
 - `pgn`: 1 to `MAX_PGN_LENGTH` characters (default cap 200,000).
 - `results`: 1 to `MAX_ANALYSIS_RESULTS` entries (default cap 5,000), same shape as above, one per ply.
 - Supports Chess960 / custom starting positions via `[SetUp "1"]` + `[FEN "..."]` headers; opening detection is skipped for non-standard starting positions.
+- If the PGN includes `[%clk ...]` clock annotations (and ideally a `TimeControl` header), the response also includes per-move `efficiency` (see [Efficiency](#efficiency-who-is-playing-better-right-now)).
 
 **Response**
 
@@ -314,6 +328,11 @@ Each entry returned by the analysis endpoints:
   "expected_score": 0.54,
   "accuracy": 98.7,
   "diff_expected": 0.0,
+  "efficiency": 96.4,
+  "move_time": 4.0,
+  "time_before": 180.0,
+  "eff_white": 96.4,
+  "eff_black": null,
   "move_classify": {
     "chesscom": "best",
     "chess_stat": "advance"
@@ -323,6 +342,9 @@ Each entry returned by the analysis endpoints:
 
 - `evaluation` is either a float in pawns (centipawn score / 100) or a string like `"# 3"` / `"# -0"` for forced mate.
 - `accuracy` is a running average (Chess.com-style win% based formula) up to and including that move, for the side that just moved.
+- `efficiency` is this move's individual efficiency score (`0`–`100`, see [Efficiency](#efficiency-who-is-playing-better-right-now)) combining move quality and time spent; `null` when the PGN has no clock data for this move.
+- `move_time` / `time_before` are the seconds spent on this move and the clock time available beforehand (from PGN `[%clk ...]` tags, or the time control's base time for the very first move of each side); both `null` without clock data.
+- `eff_white` / `eff_black` are the rolling average of the last 3 efficiency values for White/Black respectively — read together as an "efficiency eval bar" showing who is currently playing better, independent of the raw engine evaluation. Only the field for the side that just moved updates on a given entry; the other carries the previous value forward.
 
 ---
 
@@ -646,7 +668,7 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 
 1. Клиент (браузер) локально запускает Stockfish по ходам партии и получает одну оценку (`{type, value}`) плюс `best_move` для каждого полухода.
 2. Клиент отправляет эти готовые результаты в `POST /analyze/pgn` или `POST /analyze/last/{site}/{username}/{index}`.
-3. Сервер превращает сырые оценки в **классификации** ходов (best / excellent / good / inaccuracy / mistake / blunder / great / brilliant / miss / theory, плюс собственная система классификации chess-stat.ru — `chess_stat`), рассчитывает **accuracy** (точность) и определяет **дебют** — и кэширует результат в Redis для эндпоинтов анализа партий.
+3. Сервер превращает сырые оценки в **классификации** ходов (best / excellent / good / inaccuracy / mistake / blunder / great / brilliant / miss / theory, плюс собственная система классификации chess-stat.ru — `chess_stat`), рассчитывает **accuracy** (точность), показатель **efficiency** (эффективность, см. ниже) и определяет **дебют** — и кэширует результат в Redis для эндпоинтов анализа партий.
 
 ### Системы классификации ходов
 
@@ -658,6 +680,19 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 ### Определение дебюта
 
 Начальная последовательность ходов партии сопоставляется с базой дебютов ECO (категории A–E), чтобы определить название дебюта и пометить ходы «theory», совпадающие с известными дебютными линиями.
+
+### Efficiency: кто на самом деле сильнее играет *прямо сейчас*
+
+Одной оценки движка недостаточно, чтобы понять, у кого сейчас инициатива — она показывает только, у кого позиция лучше. Два игрока могут прийти к одной и той же позиции совершенно разными путями: один — уверенно и быстро, другой — еле держится и тратит на это всё время на часах. `efficiency` (эффективность) призвана показать именно эту разницу.
+
+Для каждого хода эффективность объединяет два фактора:
+
+- **Качество хода** — насколько ход был близок к лучшему (`diff_expected`, та же дельта ожидаемого счёта, что используется для классификации), поэтому неточный ход сразу штрафуется независимо от того, насколько быстро он был сделан.
+- **Затраченное время** — доля времени, потраченного на ход, относительно базового контроля времени (`move_time / time_before`, с ограничением сверху, чтобы экстремальные выбросы не доминировали), поэтому «правильный», но мучительно долго найденный ход всё равно оценивается как более слабый момент для этого игрока.
+
+Эти факторы объединяются в единый показатель по каждому ходу в диапазоне `[0, 100]`, а затем сглаживаются в `eff_white` / `eff_black`: скользящее среднее по последним **3** ходам каждой стороны (`EFF_WINDOW_PER_SIDE`), чтобы число отражало *текущую форму игрока в позиции*, а не один случайный удачный или неудачный ход. `efficiency` требует наличия часов в PGN (аннотации `[%clk ...]`); без данных о часах он — и `eff_white`/`eff_black` — равны `null`.
+
+**Как читать это в виде eval-бара:** если построить `eff_white` относительно `eff_black` по ходу партии, получится второй бар рядом с баром оценки движка. Бар движка говорит, кто сейчас впереди по позиции; бар эффективности — кто сейчас под давлением. Показательная картина: белые проигрывают по оценке движка, но чёрные — хоть и стоят лучше — тратят очень много времени на каждый ход (позиция сложная, чёрные ещё не чувствуют выигрыша), в то время как белые отвечают быстро и точно. Здесь эффективность белых выше эффективности чёрных, даже если оценка белых ниже — это сигнал, что чёрные с большей вероятностью ошибутся по ходу дальнейшей партии, и у белых есть реальный практический шанс вернуться в выигрышную (или как минимум равную) позицию.
 
 ---
 
@@ -846,6 +881,7 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 - `pgn`: от 1 до `MAX_PGN_LENGTH` символов (по умолчанию максимум 200 000).
 - `results`: от 1 до `MAX_ANALYSIS_RESULTS` элементов (по умолчанию максимум 5000), та же форма, что и выше, по одному на полуход.
 - Поддерживает Chess960 / кастомные начальные позиции через заголовки `[SetUp "1"]` + `[FEN "..."]`; определение дебюта пропускается для нестандартных начальных позиций.
+- Если PGN содержит аннотации часов `[%clk ...]` (и в идеале заголовок `TimeControl`), в ответе также присутствует показатель `efficiency` для каждого хода (см. [Efficiency](#efficiency-кто-на-самом-деле-сильнее-играет-прямо-сейчас)).
 
 **Ответ**
 
@@ -875,6 +911,11 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
   "expected_score": 0.54,
   "accuracy": 98.7,
   "diff_expected": 0.0,
+  "efficiency": 96.4,
+  "move_time": 4.0,
+  "time_before": 180.0,
+  "eff_white": 96.4,
+  "eff_black": null,
   "move_classify": {
     "chesscom": "best",
     "chess_stat": "advance"
@@ -884,6 +925,9 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 
 - `evaluation` — либо число в пешках (сантипешечная оценка / 100), либо строка вида `"# 3"` / `"# -0"` для форсированного мата.
 - `accuracy` — накопительное среднее (формула на основе win% в стиле Chess.com) до этого хода включительно, для стороны, только что сходившей.
+- `efficiency` — показатель эффективности отдельного хода (`0`–`100`, см. [Efficiency](#efficiency-кто-на-самом-деле-сильнее-играет-прямо-сейчас)), объединяющий качество хода и затраченное на него время; `null`, если для этого хода в PGN нет данных о часах.
+- `move_time` / `time_before` — сколько секунд потрачено на ход и сколько времени было на часах до него (из тегов `[%clk ...]` PGN, либо базовое время контроля для самого первого хода каждой стороны); оба `null` без данных о часах.
+- `eff_white` / `eff_black` — скользящее среднее последних 3 значений эффективности для белых/чёрных соответственно — читаются вместе как «eval-бар эффективности», показывающий, кто сейчас играет сильнее, независимо от сырой оценки движка. В каждой записи обновляется только поле стороны, которая только что сходила; второе несёт предыдущее значение дальше.
 
 ---
 
