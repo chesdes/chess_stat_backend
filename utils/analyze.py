@@ -11,6 +11,10 @@ CPU_LIMIT = os.cpu_count()
 analysis_semaphore = threading.Semaphore(CPU_LIMIT)
 
 class Analyzer:
+    EFF_K = 2.0
+    EFF_WINDOW_PER_SIDE = 3
+    EFF_MAX_TIME_FRAC = 2.0
+
     def __init__(self, depth: int = 15):
         self.depth = depth
         self.PV = {
@@ -64,6 +68,9 @@ class Analyzer:
         if len(analyze) != len(moves):
             raise ValueError("Analysis result count must match the number of PGN moves.")
 
+        clocks = self._extract_clocks(game, len(moves))
+        base_seconds, increment = self._parse_time_control(game.headers.get("TimeControl", ""))
+
         if game.board() == chess.Board():
             last_win_precent = 50
             opening = find_closest_opening(pgn_text)
@@ -78,6 +85,9 @@ class Analyzer:
         last_diff = None
         move_index = 0
         cps = []
+        last_clock = [None, None]
+        eff_window = [[], []]
+        eff_avg = [None, None]
         for move in moves:
             uci = move.uci()
             is_sacrifice = self._is_sacrifice(move, board)
@@ -112,6 +122,17 @@ class Analyzer:
             
             average_accuracy = sum(accuracy_list[move_index % 2]) / len(accuracy_list[move_index % 2])
 
+            efficiency, move_time, time_before = self._move_efficiency(
+                diff, move_index, clocks, last_clock, base_seconds, increment
+            )
+            if efficiency is not None:
+                side = move_index % 2
+                eff_window[side].append(efficiency)
+                eff_window[side] = eff_window[side][-self.EFF_WINDOW_PER_SIDE:]
+                eff_avg[side] = round(sum(eff_window[side]) / len(eff_window[side]), 1)
+            if clocks[move_index] is not None:
+                last_clock[move_index % 2] = clocks[move_index]
+
             results.append({
                 "fen": fen,
                 "move": uci,
@@ -120,6 +141,11 @@ class Analyzer:
                 "expected_score": expected_score,
                 "accuracy": round(average_accuracy, 1),
                 "diff_expected": diff,
+                "efficiency": efficiency,
+                "move_time": move_time,
+                "time_before": time_before,
+                "eff_white": eff_avg[0],
+                "eff_black": eff_avg[1],
                 "move_classify": {
                     "chesscom": chesscom_classify,
                     "chess_stat": chess_stat_classify
@@ -135,6 +161,69 @@ class Analyzer:
 
         return results
     
+    @staticmethod
+    def _extract_clocks(game, count: int) -> list:
+        try:
+            clocks = [node.clock() for node in game.mainline()]
+        except Exception:
+            clocks = []
+        clocks = [float(c) if c is not None else None for c in clocks]
+        if len(clocks) < count:
+            clocks = clocks + [None] * (count - len(clocks))
+        return clocks[:count]
+
+    @staticmethod
+    def _parse_time_control(raw) -> tuple:
+        if not raw or not isinstance(raw, str):
+            return None, 0.0
+        text = raw.strip()
+        if text in ("-", "*"):
+            return None, 0.0
+        # '40/7200:3600' style: keep the last segment.
+        if "/" in text:
+            text = text.rsplit("/", 1)[-1]
+        base = None
+        increment = 0.0
+        # '300+2' or '300'
+        if "+" in text:
+            base_part, inc_part = text.split("+", 1)
+            try:
+                base = float(base_part)
+            except (TypeError, ValueError):
+                base = None
+            try:
+                increment = float(inc_part)
+            except (TypeError, ValueError):
+                increment = 0.0
+        else:
+            try:
+                base = float(text)
+            except (TypeError, ValueError):
+                base = None
+        if base is not None and base < 0:
+            base = None
+        if increment < 0 or increment != increment:  # NaN guard
+            increment = 0.0
+        return base, increment
+
+    def _move_efficiency(self, diff, move_index, clocks, last_clock, base_seconds, increment):
+        side = move_index % 2
+        clock_after = clocks[move_index] if move_index < len(clocks) else None
+        time_before = last_clock[side]
+        if time_before is None:
+            time_before = base_seconds
+        if clock_after is None or time_before is None or time_before <= 0:
+            return None, None, round(time_before, 1) if time_before else None
+        move_time = time_before - clock_after + (increment or 0.0)
+        if move_time < 0:
+            move_time = 0.0
+        time_frac = move_time / time_before
+        if time_frac > self.EFF_MAX_TIME_FRAC:
+            time_frac = self.EFF_MAX_TIME_FRAC
+        quality = 1.0 - min(max(float(diff), 0.0), 1.0)
+        eff = 100.0 * quality / (1.0 + self.EFF_K * time_frac)
+        return round(eff, 1), round(move_time, 1), round(time_before, 1)
+
     def _get_chess_stat_move_classifies(self, diff: float, move_index: int, 
                                       uci: str, opening: list[str], best_move: str,
                                       last_diff: float):
