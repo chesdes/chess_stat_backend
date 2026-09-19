@@ -148,5 +148,51 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(result[0]["move"], "f4b8")
 
 
+    def test_calculate_info_accepts_unknown_elo(self):
+        # Lichess casual games with Anonymous export WhiteElo "?" — must not 422.
+        for white_elo in ("?", "-", "", "???", None):
+            header = "" if white_elo is None else f'[WhiteElo "{white_elo}"]\n'
+            pgn = f'{header}[BlackElo "1500"]\n\n1. e4 e5'
+            result = self.analyzer.calculate_info(self.analysis, pgn)
+
+            self.assertEqual(len(result), 2)
+            self.assertEqual(result[0]["move"], "e2e4")
+
+    def test_calculate_info_accepts_lichess_chess960_anonymous(self):
+        pgn = (
+            '[Event "casual variant:chess960 game"]\n'
+            '[Site "https://lichess.org/m8XhkJCV"]\n'
+            '[Date "2026.09.19"]\n'
+            '[Round "-"]\n'
+            '[White "Anonymous"]\n'
+            '[Black "chesdes"]\n'
+            '[Result "0-1"]\n'
+            '[UTCDate "2026.09.19"]\n'
+            '[UTCTime "21:58:15"]\n'
+            '[WhiteElo "?"]\n'
+            '[BlackElo "1500"]\n'
+            '[Variant "Chess960"]\n'
+            '[TimeControl "-"]\n'
+            '[Termination "Normal"]\n'
+            '[FEN "bqnbnrkr/pppppppp/8/8/8/8/PPPPPPPP/BQNBNRKR w KQkq - 0 1"]\n'
+            '[SetUp "1"]\n'
+            '\n'
+            '1. g4 c5 2. e3 Qd6 3. f4 b6 4. Ned3 Bxh1 5. Kxh1 Qd5+ 6. Bf3 Qc4 '
+            '7. c3 f5 8. Ne5 Qe6 9. c4 Nf6 10. Bd5 Nxd5 11. cxd5 Qxd5+ 12. e4 fxe4 '
+            '13. Nb3 e3+ 14. Nf3 e2 15. Nd4 exf1=Q+ 16. Qxf1 Rxf4 17. Ne2 Rxf3 '
+            '18. Ng3 Rxf1# 0-1'
+        )
+        analysis = [
+            {"info": {"type": "cp", "value": 20}, "best_move": "g2g4"}
+            for _ in range(36)
+        ]
+        result = self.analyzer.calculate_info(analysis, pgn)
+
+        self.assertEqual(len(result), 36)
+        self.assertEqual(result[0]["move"], "g2g4")
+        self.assertEqual(result[-1]["move"], "f3f1")
+        self.assertIn("move_classify", result[0])
+
+
 if __name__ == "__main__":
     unittest.main()

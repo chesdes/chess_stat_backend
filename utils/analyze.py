@@ -56,11 +56,8 @@ class Analyzer:
         if not game:
             raise ValueError("Failed to parse PGN text.")
 
-        try:
-            whiteElo = int(game.headers.get("WhiteElo", 0) or 0)
-            blackElo = int(game.headers.get("BlackElo", 0) or 0)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("PGN ratings must be integers.") from exc
+        whiteElo = self._parse_elo(game.headers.get("WhiteElo", 0))
+        blackElo = self._parse_elo(game.headers.get("BlackElo", 0))
 
         moves = list(game.mainline_moves())
         if not moves:
@@ -161,6 +158,22 @@ class Analyzer:
 
         return results
     
+    @staticmethod
+    def _parse_elo(raw) -> int:
+        if raw is None:
+            return 0
+        text = str(raw).strip()
+        if not text or text in ("?", "-", "*", "—", "--", "???"):
+            return 0
+        try:
+            return int(text)
+        except (TypeError, ValueError):
+            pass
+        try:
+            return int(float(text))
+        except (TypeError, ValueError):
+            return 0
+
     @staticmethod
     def _extract_clocks(game, count: int) -> list:
         try:
