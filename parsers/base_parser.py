@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from models import PlayerProfile, Game
+from models import PlayerCard, PlayerProfile, Game
 
 
 class PlayerNotFoundError(ValueError):
@@ -11,6 +11,10 @@ class BaseParser(ABC):
 
     @abstractmethod
     async def get_profile(self, username: str) -> PlayerProfile | None:
+        pass
+
+    @abstractmethod
+    async def get_profile_card(self, username: str) -> PlayerCard | None:
         pass
 
     @abstractmethod

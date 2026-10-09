@@ -1,13 +1,37 @@
 from datetime import datetime, timezone, timedelta
-from models import PlayerProfile, Game, Player, Stats, TimeControl
-from utils import UpstreamHTTPError, get_json
+from models import PlayerCard, PlayerProfile, Game, Player, Stats, TimeControl
+from utils import UpstreamHTTPError, get_json, get_month_archive, get_archives_list
 from .base_parser import BaseParser, PlayerNotFoundError
 import asyncio
+import re
 
 BASE_URL = "https://api.chess.com/pub/player"
+_ARCHIVE_URL_RE = re.compile(r"/games/(\d{4})/(\d{2})$")
 
 class ChessComParser(BaseParser):
     site = "chesscom"
+
+    async def get_profile_card(self, username: str) -> PlayerCard | None:
+        profile_url = f"{BASE_URL}/{username}"
+        try:
+            data = await get_json(profile_url)
+        except UpstreamHTTPError as e:
+            if e.status_code == 404:
+                raise PlayerNotFoundError(username) from e
+            raise
+        if not data:
+            raise ValueError("profile data is null")
+
+        country_data = await get_json(data.get("country"))
+        country = country_data.get("code") if country_data else None
+
+        return PlayerCard(
+            site=self.site,
+            username=data.get("username"),
+            avatar=data.get("avatar"),
+            title=data.get("title"),
+            country=country,
+        )
 
     async def get_profile(self, username: str) -> PlayerProfile | None:
         profile_url = f"{BASE_URL}/{username}"
@@ -66,9 +90,23 @@ class ChessComParser(BaseParser):
     async def _get_stats(self, username: str) -> dict:
         return await get_json(f"{BASE_URL}/{username}/stats") or {}
 
+    def _archives_url(self, username: str) -> str:
+        return f"{BASE_URL}/{username}/games/archives"
+
+    async def _fetch_archive_url(self, username: str, url: str):
+        match = _ARCHIVE_URL_RE.search(url)
+        if match:
+            year, month = int(match.group(1)), int(match.group(2))
+            return await get_month_archive(
+                self.site, username, year, month, url,
+                lambda: get_json(url),
+            )
+        return await get_json(url)
+
     async def get_last_games(self, username: str, limit: int = 100, offset: int = 0, control: str | None = None) -> list[Game]:
+        archives_url = self._archives_url(username)
         try:
-            archives = await get_json(f"{BASE_URL}/{username}/games/archives")
+            archives = await get_archives_list(self.site, username, archives_url, lambda: get_json(archives_url))
         except UpstreamHTTPError as e:
             if e.status_code == 404:
                 raise PlayerNotFoundError(username) from e
@@ -82,7 +120,7 @@ class ChessComParser(BaseParser):
 
         for url in urls:
             try:
-                data = await get_json(url)
+                data = await self._fetch_archive_url(username, url)
             except UpstreamHTTPError as e:
                 if e.status_code == 404:
                     # A gameless or briefly flaky month must not kill the page.
@@ -107,7 +145,7 @@ class ChessComParser(BaseParser):
 
     async def get_month_games(self, username: str, year: int, month: int, control: str | None = None) -> list[Game]:
         url = f"{BASE_URL}/{username}/games/{year}/{month:02d}"
-        data = await get_json(url)
+        data = await get_month_archive(self.site, username, year, month, url, lambda: get_json(url))
         if not data:
             raise ValueError("data is null")
 
@@ -120,7 +158,7 @@ class ChessComParser(BaseParser):
 
     async def get_day_games(self, username: str, year: int, month: int, day: int, control: str | None = None):
         url = f"{BASE_URL}/{username}/games/{year}/{month:02d}"
-        data = await get_json(url)
+        data = await get_month_archive(self.site, username, year, month, url, lambda: get_json(url))
         if not data:
             raise ValueError("data is null")
 
@@ -148,7 +186,7 @@ class ChessComParser(BaseParser):
         tasks = []
         while current <= end_dt+timedelta(days=1):
             url = f"{BASE_URL}/{username}/games/{current.year}/{current.month:02d}"
-            tasks.append(get_json(url))
+            tasks.append(self._fetch_archive_url(username, url))
             if current.month == 12:
                 current = datetime(current.year + 1, 1, 1, tzinfo=timezone.utc)
             else:
@@ -173,8 +211,9 @@ class ChessComParser(BaseParser):
         if not got_any_month:
             # Every month 404'd: either an idle account (fine, empty graph)
             # or a missing player — tell them apart with one archives call.
+            archives_url = self._archives_url(username)
             try:
-                await get_json(f"{BASE_URL}/{username}/games/archives")
+                await get_archives_list(self.site, username, archives_url, lambda: get_json(archives_url))
             except UpstreamHTTPError as e:
                 if e.status_code == 404:
                     raise PlayerNotFoundError(username) from e

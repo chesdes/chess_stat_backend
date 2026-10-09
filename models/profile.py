@@ -8,3 +8,10 @@ class PlayerProfile(BaseModel):
     country: str | None = None
     title: str | None = None
     stats: Stats
+
+class PlayerCard(BaseModel):
+    site: str
+    username: str
+    avatar: str | None = None
+    country: str | None = None
+    title: str | None = None

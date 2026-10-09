@@ -14,6 +14,8 @@ class Analyzer:
     EFF_K = 2.0
     EFF_WINDOW_PER_SIDE = 3
     EFF_MAX_TIME_FRAC = 2.0
+    ACC_WIN_K = 0.10
+    ACC_WIN_CP_SCALE = 0.004
 
     def __init__(self, depth: int = 15):
         self.depth = depth
@@ -69,15 +71,15 @@ class Analyzer:
         base_seconds, increment = self._parse_time_control(game.headers.get("TimeControl", ""))
 
         if game.board() == chess.Board():
-            last_win_precent = 50
+            last_cp = 0
             opening = find_closest_opening(pgn_text)
         else:
-            last_win_precent = None
+            last_cp = None
             opening = {"moves": []}
         board = game.board()
         results = []
         last_expected = None
-        accuracy_list = [[100.0], [100.0]]
+        accuracy_list = [[], []]
         last_chesscom_classify = None
         last_diff = None
         move_index = 0
@@ -109,15 +111,15 @@ class Analyzer:
                                                                 cpawns, is_sacrifice
                                                                 )
             
-            win_precent = self._get_win_procentage_in_position(cpawns)
-            if info["type"] == "mate" and info["value"] == 0:
-                accuracy = 100.0
-            else:
-                accuracy = self._get_accuracy_procentage(last_win_precent if last_win_precent else win_precent, win_precent)
+            move_acc = self._get_move_accuracy(
+                cpawns, last_cp, move_index,
+                info["type"] == "mate" and info["value"] == 0,
+            )
             if not (move_index < len(opening["moves"]) and uci == opening["moves"][move_index]):
-                accuracy_list[move_index % 2].append(accuracy)
-            
-            average_accuracy = sum(accuracy_list[move_index % 2]) / len(accuracy_list[move_index % 2])
+                accuracy_list[move_index % 2].append(move_acc)
+
+            side_list = accuracy_list[move_index % 2]
+            average_accuracy = self._get_side_accuracy(side_list)
 
             efficiency, move_time, time_before = self._move_efficiency(
                 diff, move_index, clocks, last_clock, base_seconds, increment
@@ -149,7 +151,7 @@ class Analyzer:
                 }
             })
 
-            last_win_precent = win_precent
+            last_cp = cpawns
             last_chesscom_classify = chesscom_classify
             last_diff = diff
             last_expected = expected_score
@@ -308,11 +310,27 @@ class Analyzer:
             return 1.0 if mate_in > 0 else 0.0
         return 1 / (1 + 10 ** (-float(st_eval) / 4.0))
     
-    def _get_win_procentage_in_position(self,cp: int) -> float:
-        return 50 + (50*((2/(1+(math.e**(-0.004*cp))))-1))
-    
-    def _get_accuracy_procentage(self, winPercentBefore: float, winPercentAfter: float):
-        return (103.1668 * math.e**(-0.04354*(abs(winPercentBefore-winPercentAfter)))) - 3.1669
+    def _get_win_percentage(self, cp: int) -> float:
+        return 50 + (50 * ((2 / (1 + (math.e ** (-self.ACC_WIN_CP_SCALE * cp)))) - 1))
+
+    def _get_move_accuracy(self, cp_after: int, cp_before: int | None,
+                           move_index: int, is_mate_delivered: bool) -> float:
+        if is_mate_delivered or cp_before is None:
+            return 100.0
+        w_before = self._get_win_percentage(cp_before)
+        w_after = self._get_win_percentage(cp_after)
+        if move_index % 2 == 0:
+            drop = w_before - w_after
+        else:
+            drop = w_after - w_before
+        if drop <= 1e-9:
+            return 100.0
+        return max(0.0, 103.1668 * math.exp(-self.ACC_WIN_K * drop) - 3.1669)
+
+    def _get_side_accuracy(self, acc_list: list[float]) -> float:
+        if not acc_list:
+            return 100.0
+        return sum(acc_list) / len(acc_list)
 
     def _capture_chain_eval(self, board: chess.Board, move: chess.Move) -> int:
         square = move.to_square

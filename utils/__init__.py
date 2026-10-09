@@ -10,6 +10,7 @@ from .analyze import Analyzer
 from .visitor_names import visitor_name
 from .openings import find_closest_opening
 from .redis_client import RedisClient
+from .archive_cache import get_archives_list, get_month_archive
 
 __all__ = [
 	"UpstreamError",
@@ -22,4 +23,6 @@ __all__ = [
 	"visitor_name",
 	"find_closest_opening",
 	"RedisClient",
+	"get_month_archive",
+	"get_archives_list",
 ]

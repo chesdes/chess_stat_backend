@@ -20,6 +20,7 @@ All routes below are mounted under the `/api` root path in production (`root_pat
 
 - [Tech stack](#tech-stack)
 - [Concepts](#concepts)
+- [Formulas](#formulas)
 - [Endpoints](#endpoints)
   - [Profile](#profile)
   - [Games](#games)
@@ -110,6 +111,143 @@ For each move, efficiency combines two things:
 These are combined into a single per-move score in `[0, 100]`, then smoothed into `eff_white` / `eff_black`: a rolling average over each side's last **3** moves (`EFF_WINDOW_PER_SIDE`), so the number reflects *recent form in the position*, not a single lucky or unlucky move. `efficiency` requires a clock in the PGN (`[%clk ...]` annotations); without clock data it — and `eff_white`/`eff_black` — is `null`.
 
 **Reading it as an eval bar:** plotting `eff_white` against `eff_black` over the course of a game gives a second bar alongside the engine evaluation bar. The engine bar says who's ahead; the efficiency bar says who's currently under pressure. A telling pattern: White is worse by engine evaluation, but Black — despite standing better — is burning large amounts of time each move (the position is hard, Black doesn't yet feel the win), while White responds quickly and accurately. Here White's efficiency is higher than Black's even though White's evaluation is lower — a signal that Black is more likely to err as the position continues, and White has a realistic practical path back into (or to) a winning position.
+
+---
+
+## Formulas
+
+### 1. Evaluation -> expected score $w$
+
+Each ply has a Stockfish evaluation:
+- either centipawns $c$ (`{"type": "cp"}`)
+- or mate in $m$ moves (`{"type": "mate"}`).
+
+Pawn score is $s = \frac{c}{100}$. The displayed value is $s$ rounded to 2 decimals, or `# m` for mate.
+
+Win-probability mapping (White-relative):
+
+$
+w(s) = \frac{1}{1 + 10^{-s / 4}}, \qquad
+w_{\text{mate}}(m) = \begin{cases} 1.0, & m > 0 \\ 0.0, & m \le 0 \end{cases}
+$
+
+In plain terms:
+- $s = 0 \Rightarrow w = 0.5$ (equal)
+- $s = +1 \Rightarrow w \approx 0.64$
+- $s = +2 \Rightarrow w \approx 0.76$
+- White can deliver mate in $m$ moves — $1$
+- White is getting mated in $m$ moves — $0$.
+
+### 2. Move swing $\Delta w$ (`diff_expected`)
+
+The cost of a move is the change in win probability $w(s)$ relative to the previous ply:
+
+$$
+\Delta w_i = |\, w_i - w_{i-1} \,|, \qquad \Delta w_0 = 0
+$$
+
+$\Delta w$ is the single input for both classification systems. The smaller $\Delta w$, the better the move. The underlying assumption is that a move cannot improve your position in the eyes of an engine calculating 20+ plies ahead: the engine's best move preserves the evaluation.
+
+### 3. Accuracy
+
+**Per-move accuracy.** Centipawn evaluations (White-relative) are mapped to win probability, then each move is scored by how much win percentage the mover gave away:
+
+$$
+w(c) = 50 + 50\left(\frac{2}{1 + e^{-0.004\, c}} - 1\right)
+$$
+
+The drop is measured from the mover's point of view (an improvement costs nothing):
+
+$$
+D_i = \begin{cases}
+w_{before} - w_{after}, & \text{White to move} \\
+w_{after} - w_{before}, & \text{Black to move}
+\end{cases}
+$$
+
+$$
+acc_i = \begin{cases}
+100, & D_i \le 0\ \text{(improvement or equal)} \\
+100, & \text{mate is delivered} \\
+\max(0,\ 103.1668 \cdot e^{-0.10\, D_i} - 3.1669), & D_i > 0
+\end{cases}
+$$
+
+In plain terms:
+- $D = 2 \Rightarrow acc_i \approx 81.3$
+- $D = 5 \Rightarrow acc_i \approx 59.4$
+- $D = 10 \Rightarrow acc_i \approx 34.8$
+- $D = 20 \Rightarrow acc_i \approx 10.8$
+
+The core idea is based on this [article](https://lichess.org/forum/team-zNAEJBNN/RxgX6G2C) about the Lichess accuracy metric.
+
+### 4. Efficiency
+
+This is an original metric intended to evaluate a position from a more *human* perspective. Combining engine evaluation with time spent can show how comfortable a player really is in a position: the engine may consider White's position winning, but if White spends a very long time finding the right moves, is the position actually comfortable for the player? Efficiency is designed to answer that question and show who has been playing "better" over the last few moves, while also indicating the likely direction of the game.
+
+PGN clock annotations are required; without them the metric cannot be calculated.
+
+$$
+t_{move} = \max\bigl(0,\ t_{before} - t_{after} + inc\bigr)
+$$
+
+$t_{before}$ is the mover's time before the move (the previous clock value for that color, or the base time from the `TimeControl` header for that side's first move), $t_{after}$ is the time after the move, and $inc$ is the increment in seconds.
+
+$$
+f = \min\!\left(\frac{t_{move}}{t_{before}},\ 2.0\right), \qquad
+q = 1 - \min(\max(\Delta w_i, 0), 1), \qquad
+eff_i = 100 \cdot \frac{q}{1 + 2\, f}
+$$
+
+Examples:
+- a perfect move played quickly ($\Delta w = 0$, $f \approx 0$) $\Rightarrow eff_i = 100$
+- a perfect move that uses 10% of the available time ($f = 0.1$) $\Rightarrow eff_i = 100/1.2 \approx 83.3$
+- a half-point blunder played quickly ($\Delta w = 0.5$, $f = 0.02$) $\Rightarrow eff_i = 50/1.04 \approx 48$
+
+The final analysis attaches a rolling efficiency average over each side's last 3 moves.
+
+$$
+Eff_{White} = \mathrm{mean}(\text{last 3 } eff_i \text{ of White}), \qquad
+Eff_{Black} = \mathrm{mean}(\text{last 3 } eff_i \text{ of Black})
+$$
+
+### 5. Performance rating
+
+Standard FIDE-style definition: the rating $R_p$ at which the expected score against the opponents actually faced equals the score actually achieved. With opponent ratings $R_1 \dots R_n$ and total score $S = W \cdot 1 + D \cdot 0.5 + L \cdot 0$:
+
+$$ 
+E(R_p) = \sum_{j=1}^{n} \frac{1}{1 + 10^{(R_j - R_p)/400}}, \qquad
+E(R_p) = S \ \Rightarrow\ R_p
+$$
+
+Solved by binary search on $[\,0.8 \cdot \min R_j,\ 1.2 \cdot \max R_j\,]$ to $0.001$ tolerance, then rounded to an integer. No games $\Rightarrow 0$. In plain terms: a win pulls the rating above the opponents' average, while a loss pulls it below.
+
+### 6. Classification thresholds
+
+**`chess_stat`** (own system):
+
+| Class | Condition |
+|---|---|
+| `advance` | played `best_move`, or $\Delta w \le 0.04$ |
+| `steady` | $\Delta w \le 0.12$ |
+| `miss` | $\Delta w \ge 0.09$ **and** previous move had $\Delta w_{prev} > 0.12$ (opponent just blundered, you didn't punish) |
+| `retreat` | otherwise (large $\Delta w$ without the `miss` context) |
+| `theory` | in opening book line |
+
+**`chesscom`** (Chess.com vocabulary, Elo-adjusted; $bonus = \frac{4000 - Elo}{4000} \cdot 0.05$, so weaker players get slightly wider "good" windows):
+
+| Class | Condition on $\Delta w$ |
+|---|---|
+| `best` | played `best_move` or $\Delta w = 0$ |
+| `excellent` | $\Delta w \le 0.02 + bonus$ |
+| `good` | $\Delta w \le 0.05 + bonus$ |
+| `inaccuracy` | $\Delta w \le 0.10 + bonus$ |
+| `mistake` | $\Delta w \le 0.20 + bonus$ |
+| `blunder` | larger |
+| `great` | `best` + evaluation swing compared with the player's previous move $> (100 + Elo/40)$ centipawns in the player's favor |
+| `brilliant` | `best` + material sacrifice (SEE-like capture chain $< 0$, attacking piece worth more than the captured piece) that preserves or increases the advantage |
+| `miss` | `blunder` immediately after an opponent's `blunder` (the opportunity was there, but both missed it) |
+| `theoretical` | in opening book line |
 
 ---
 
@@ -239,11 +377,46 @@ Fetch a previously cached analysis for a recent game, without submitting new Sto
 ```json
 {
   "game": { "...": "Game object" },
-  "analyze": [ "...move classification objects, or null if not yet analyzed" ]
+  "profiles": {
+    "white": { "...": "PlayerCard or null" },
+    "black": { "...": "PlayerCard or null" }
+  },
+  "analyze": [ "...move classification objects, or null if not yet analyzed" ],
+  "share_id": "a1B2c3D4e or null"
 }
 ```
 
+`profiles` contains compact player cards embedded in the analysis response, so clients do not need separate profile requests. When cached analysis is available, `share_id` can be used to retrieve the same snapshot through [`GET /analyze/shared/{share_id}`](#get-analyzesharedshare_id).
+
 **Errors:** `404` if the player or that game index doesn't exist.
+
+---
+
+#### `GET /analyze/shared/{share_id}`
+
+Retrieve a previously generated analysis snapshot by its share ID. Snapshots are stored in Redis for the same 3-day TTL as regular game-analysis cache entries.
+
+**Path parameters**
+
+| Name | Type | Constraints | Description |
+|---|---|---|---|
+| `share_id` | string | 8–12 characters (`A-Z`, `a-z`, `0-9`, `_`, `-`) | Share ID returned by an analysis endpoint |
+
+**Response**
+
+```json
+{
+  "game": { "...": "Game object" },
+  "profiles": {
+    "white": { "...": "PlayerCard or null" },
+    "black": { "...": "PlayerCard or null" }
+  },
+  "analyze": [ "...move classification objects" ],
+  "share_id": "a1B2c3D4e"
+}
+```
+
+**Errors:** `404` if the share ID is invalid, expired, or not found; `422` if the share ID format is invalid.
 
 ---
 
@@ -268,7 +441,7 @@ Submit client-computed Stockfish results for a specific recent game; the server 
 - `info.type` is `"cp"` (centipawns) or `"mate"` (moves to mate); `info.value` is clamped to `[-10000, 10000]`.
 - `best_move`, if present, must be UCI notation (`^[a-h][1-8][a-h][1-8][qrbnQRBN]?$`).
 
-**Response** — same shape as the `GET` variant, with `analyze` always populated.
+**Response** — same shape as the `GET` variant, with `analyze` always populated and a newly generated `share_id`.
 
 **Errors**
 
@@ -282,7 +455,7 @@ Submit client-computed Stockfish results for a specific recent game; the server 
 
 #### `POST /analyze/pgn`
 
-Classify an arbitrary PGN (not tied to a specific site/player) using client-supplied Stockfish results. Useful for analyzing games not fetched through this API, e.g. imported or manually pasted PGNs. Results here are **not cached**.
+Classify an arbitrary PGN (not tied to a specific site/player) using client-supplied Stockfish results. Useful for analyzing games not fetched through this API, e.g. imported or manually pasted PGNs. The result is not stored in the regular game-analysis cache, but a 3-day Redis snapshot is created so it can be opened through a share link.
 
 **Request body** — [`AnalyzeAndPgnPayload`](#analyzeandpgnpayload)
 
@@ -303,7 +476,12 @@ Classify an arbitrary PGN (not tied to a specific site/player) using client-supp
 **Response**
 
 ```json
-{ "analyze": [ "...move classification objects" ] }
+{
+  "game": { "...": "Game object built from the PGN" },
+  "profiles": { "white": null, "black": null },
+  "analyze": [ "...move classification objects" ],
+  "share_id": "a1B2c3D4e"
+}
 ```
 
 **Errors**
@@ -341,8 +519,8 @@ Each entry returned by the analysis endpoints:
 ```
 
 - `evaluation` is either a float in pawns (centipawn score / 100) or a string like `"# 3"` / `"# -0"` for forced mate.
-- `accuracy` is a running average (Chess.com-style win% based formula) up to and including that move, for the side that just moved.
-- `efficiency` is this move's individual efficiency score (`0`–`100`, see [Efficiency](#efficiency-who-is-playing-better-right-now)) combining move quality and time spent; `null` when the PGN has no clock data for this move.
+- `accuracy` is a running average (win%-drop formula) up to and including that move, for the side that just moved.
+- `efficiency` is this move's individual efficiency score (`0`–`100`, see [Efficiency](#efficiency-who-is-playing-better-right-now)), combining move quality and time spent; `null` when the PGN has no clock data for this move.
 - `move_time` / `time_before` are the seconds spent on this move and the clock time available beforehand (from PGN `[%clk ...]` tags, or the time control's base time for the very first move of each side); both `null` without clock data.
 - `eff_white` / `eff_black` are the rolling average of the last 3 efficiency values for White/Black respectively — read together as an "efficiency eval bar" showing who is currently playing better, independent of the raw engine evaluation. Only the field for the side that just moved updates on a given entry; the other carries the previous value forward.
 
@@ -496,6 +674,30 @@ Simple liveness/readiness probes, excluded from traffic statistics.
 }
 ```
 
+#### `PlayerCard`
+```json
+{
+  "site": "chesscom",
+  "username": "string",
+  "avatar": "https://... | null",
+  "country": "US | null",
+  "title": "GM | null"
+}
+```
+
+#### Analysis response
+```json
+{
+  "game": { "...": "Game" },
+  "profiles": {
+    "white": { "...": "PlayerCard or null" },
+    "black": { "...": "PlayerCard or null" }
+  },
+  "analyze": [ "...move classification objects" ],
+  "share_id": "a1B2c3D4e or null"
+}
+```
+
 #### `AnalyzePayload` / `AnalyzeAndPgnPayload`
 See the [POST /analyze/last](#post-analyzelastsiteusernameindex) and [POST /analyze/pgn](#post-analyzepgn) sections above.
 
@@ -603,6 +805,7 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 
 - [Стек технологий](#стек-технологий)
 - [Концепции](#концепции)
+- [Формулы](#формулы)
 - [Эндпоинты](#эндпоинты)
   - [Профиль](#профиль)
   - [Партии](#партии)
@@ -693,6 +896,140 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 Эти факторы объединяются в единый показатель по каждому ходу в диапазоне `[0, 100]`, а затем сглаживаются в `eff_white` / `eff_black`: скользящее среднее по последним **3** ходам каждой стороны (`EFF_WINDOW_PER_SIDE`), чтобы число отражало *текущую форму игрока в позиции*, а не один случайный удачный или неудачный ход. `efficiency` требует наличия часов в PGN (аннотации `[%clk ...]`); без данных о часах он — и `eff_white`/`eff_black` — равны `null`.
 
 **Как читать это в виде eval-бара:** если построить `eff_white` относительно `eff_black` по ходу партии, получится второй бар рядом с баром оценки движка. Бар движка говорит, кто сейчас впереди по позиции; бар эффективности — кто сейчас под давлением. Показательная картина: белые проигрывают по оценке движка, но чёрные — хоть и стоят лучше — тратят очень много времени на каждый ход (позиция сложная, чёрные ещё не чувствуют выигрыша), в то время как белые отвечают быстро и точно. Здесь эффективность белых выше эффективности чёрных, даже если оценка белых ниже — это сигнал, что чёрные с большей вероятностью ошибутся по ходу дальнейшей партии, и у белых есть реальный практический шанс вернуться в выигрышную (или как минимум равную) позицию.
+
+---
+
+## Формулы
+
+### 1. Оценка -> ожидаемый счёт $w$
+
+У каждого полухода есть оценка Stockfish: 
+- либо сантипешки $c$ (`{"type": "cp"}`) 
+- либо мат в $m$ ходов (`{"type": "mate"}`). 
+
+Счёт в пешках: $s = \frac{c}{100}$. Отображается значение $s$, округлённое до 2 знаков, либо `# m` для мата.
+
+Переход к вероятности выигрыша (относительно белых):
+
+$$
+w(s) = \frac{1}{1 + 10^{-s / 4}}, \qquad
+w_{\text{mate}}(m) = \begin{cases} 1.0, & m > 0 \\ 0.0, & m \le 0 \end{cases}
+$$
+
+Проще говоря: 
+- $s = 0 \Rightarrow w = 0{,}5$ (равно)
+- $s = +1 \Rightarrow w \approx 0{,}64$
+- $s = +2 \Rightarrow w \approx 0{,}76$. 
+- Белые могут **поставить** мат в $m$ ходов — $1$
+- Белые могут **получить** мат в $m$ ходов — $0$.
+
+### 2. Колебание оценки $\Delta w$ (`diff_expected`)
+
+Цена хода — разница вероятности выигрыша $w(s)$ относительно прошлого полухода:
+
+$$
+\Delta w_i = |\, w_i - w_{i-1} \,|, \qquad \Delta w_0 = 0
+$$
+
+$\Delta w$ — единый показатель для обеих систем классификации. Чем меньше $\Delta w$ - тем лучше ход. гипотеза основывается на том, что своим ходом ты не можешь улучшить свое положение в глазах движка, который просчитывает позицию на 20+ ходов вперед. Если ты делаешь лучший ход по версии движка, то сохраняешь оценку.
+
+### 3. Точность (accuracy)
+
+**Точность хода.** Сантипешечные оценки (относительно белых) переводятся в вероятность победы, дальше каждый ход оценивается по тому, сколько win-процентов ходивший отдал:
+
+$$
+w(c) = 50 + 50\left(\frac{2}{1 + e^{-0{,}004\, c}} - 1\right)
+$$
+
+Просадка считается с точки зрения ходившего (улучшение=0):
+
+$$
+D_i = \begin{cases}
+w_{before} - w_{after}, & \text{ход белых} \\
+w_{after} - w_{before}, & \text{ход чёрных}
+\end{cases}
+$$
+
+$$
+acc_i = \begin{cases}
+100, & D_i \le 0\ \text{(улучшение или равенство)} \\
+100, & \text{ставится мат} \\
+\max(0,\ 103{,}1668 \cdot e^{-0{,}10\, D_i} - 3{,}1669), & D_i > 0
+\end{cases}
+$$
+
+Проще говоря: 
+- $D = 2 \Rightarrow acc_i \approx 81{,}3$ 
+- $D = 5 \Rightarrow acc_i \approx 59{,}4$ 
+- $D = 10 \Rightarrow acc_i \approx 34{,}8$ 
+- $D = 20 \Rightarrow acc_i \approx 10{,}8$
+
+Фундамент идеи основан на этой [статье](https://lichess.org/forum/team-zNAEJBNN/RxgX6G2C) которая посвящена метрике точности на Lichess
+
+### 4. Эффективность (efficiency)
+
+Собственная иновационная идея метрики которая позволяет оценивать позицию более *человеческим* взглядом. Собирая оценку движка и потраченное время в одну формулу, мы можем увидеть насколько комфортно себя чувствует игрок в этой позиции: движок может оценивать позицию как выигрышную для белых, но если игрок белых тратит очень много времени на поиск верных ходов, то можно ли сказать что позиция комфортна для него и по *человечески* выигрышна? Думаю что скорее нет, чем да. Для решения этой проблемы и была создана метрика эффективности, которая показывает кто играет "лучше" последние несколько ходов, по совместительству предсказывая в каком направлении, вероятно, развернется партия в будущем.
+
+Требуются часы в PGN, иначе расчитать метрику возможности не будет.
+
+$$
+t_{move} = \max\bigl(0,\ t_{before} - t_{after} + inc\bigr)
+$$
+
+$t_{before}$ — время ходившего до хода (предыдущие часы того же цвета, либо базовое время из заголовка `TimeControl` для первого хода каждой стороны), $t_{after}$ — часы после, $inc$ — инкремент в секундах.
+
+$$
+f = \min\!\left(\frac{t_{move}}{t_{before}},\ 2{,}0\right), \qquad
+q = 1 - \min(\max(\Delta w_i, 0), 1), \qquad
+eff_i = 100 \cdot \frac{q}{1 + 2\, f}
+$$
+
+Примеры: 
+- идеальный быстрый ход ($\Delta w = 0$, $f \approx 0$) $\Rightarrow eff_i=100$
+- идеальный, но съевший 10% времени ($f = 0{,}1$) $\Rightarrow eff_i=100/1{,}2 \approx 83{,}3$
+- зевок в пол-очка, сыгранный быстро ($\Delta w = 0{,}5$, $f = 0{,}02$) $\Rightarrow eff_i=50/1{,}04 \approx 48$
+
+К ходам в итоговом анализе прикрепляется скользящее среднее значение эффективности по последним 3 ходам стороны.
+
+### 5. Перформанс-рейтинг
+
+Стандартное определение в стиле ФИДЕ: рейтинг $R_p$, при котором ожидаемый счёт против реально встреченных соперников равен фактически набранному. При рейтингах соперников $R_1 \dots R_n$ и сумме $S = W \cdot 1 + D \cdot 0{,}5 + L \cdot 0$:
+
+$$
+E(R_p) = \sum_{j=1}^{n} \frac{1}{1 + 10^{(R_j - R_p)/400}}, \qquad
+E(R_p) = S \ \Rightarrow\ R_p
+$$
+
+Решается бинпоиском на $[\,0{,}8 \cdot \min R_j,\ 1{,}2 \cdot \max R_j\,]$ с точностью $0{,}001$, затем округляется до целого. 
+
+Проще говоря: победа тянет рейтинг выше среднего рейтинга соперников, поражение — ниже.
+
+### 6. Пороги классификации
+
+**`chess_stat`** (своя система):
+
+| Класс | Условие |
+|---|---|
+| `advance` | сыгран лучший ход по версии движка или $\Delta w \le 0{,}04$ |
+| `steady` | $\Delta w \le 0{,}12$ |
+| `miss` | $\Delta w \ge 0{,}09$ **И** предыдущий ход имел $\Delta w_{prev} > 0{,}12$ (соперник только что зевнул, а вы не наказали) |
+| `retreat` | иначе (большой $\Delta w$ без контекста `miss`) |
+| `theory` | ход из дебютной книги |
+
+**`chesscom`** (словарь Chess.com, Elo-поправка; $bonus = \frac{4000 - Elo}{4000} \cdot 0{,}05$ — слабым игрокам "хорошие" окна чуть шире):
+
+| Класс | Условие на $\Delta w$ |
+|---|---|
+| `best` | сыгран `best_move` или $\Delta w = 0$ |
+| `excellent` | $\Delta w \le 0{,}02 + bonus$ |
+| `good` | $\Delta w \le 0{,}05 + bonus$ |
+| `inaccuracy` | $\Delta w \le 0{,}10 + bonus$ |
+| `mistake` | $\Delta w \le 0{,}20 + bonus$ |
+| `blunder` | больше |
+| `great` | `best` + скачок оценки по сравнению с твоим прошлым ходом $> (100 + Elo/40)$ сантипешек в твою пользу |
+| `brilliant` | `best` + жертва материала (SEE-подобная цепочка взятий $< 0$, атакующая фигура дороже взятой), сохранившая/увеличившая перевес |
+| `miss` | `blunder` сразу после `blunder` соперника (не наказал соперника за его ошибку, текущий `blunder` скорее говорит о том что позиция вернулась к "исходному" положению) |
+| `theoretical` | ход из дебютной книги |
 
 ---
 
@@ -822,11 +1159,46 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 ```json
 {
   "game": { "...": "объект Game" },
-  "analyze": [ "...объекты классификации ходов, либо null, если анализ ещё не выполнен" ]
+  "profiles": {
+    "white": { "...": "PlayerCard или null" },
+    "black": { "...": "PlayerCard или null" }
+  },
+  "analyze": [ "...объекты классификации ходов, либо null, если анализ ещё не выполнен" ],
+  "share_id": "a1B2c3D4e или null"
 }
 ```
 
+`profiles` содержит компактные карточки игроков прямо в ответе анализа, поэтому клиенту не нужны отдельные запросы профиля. Если анализ уже закэширован, `share_id` можно использовать для получения того же snapshot через [`GET /analyze/shared/{share_id}`](#get-analyzesharedshare_id).
+
 **Ошибки:** `404`, если игрок или партия с таким индексом не найдены.
+
+---
+
+#### `GET /analyze/shared/{share_id}`
+
+Получить ранее созданный snapshot анализа по share ID. Snapshot хранится в Redis с тем же TTL в 3 дня, что и обычный кэш анализа партий.
+
+**Параметры пути**
+
+| Имя | Тип | Ограничения | Описание |
+|---|---|---|---|
+| `share_id` | string | 8–12 символов (`A-Z`, `a-z`, `0-9`, `_`, `-`) | Share ID, возвращённый эндпоинтом анализа |
+
+**Ответ**
+
+```json
+{
+  "game": { "...": "объект Game" },
+  "profiles": {
+    "white": { "...": "PlayerCard или null" },
+    "black": { "...": "PlayerCard или null" }
+  },
+  "analyze": [ "...объекты классификации ходов" ],
+  "share_id": "a1B2c3D4e"
+}
+```
+
+**Ошибки:** `404`, если share ID некорректен, истёк или не найден; `422`, если формат share ID некорректен.
 
 ---
 
@@ -851,7 +1223,7 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 - `info.type` — `"cp"` (сантипешки) или `"mate"` (число ходов до мата); `info.value` ограничен диапазоном `[-10000, 10000]`.
 - `best_move`, если указан, должен быть в нотации UCI (`^[a-h][1-8][a-h][1-8][qrbnQRBN]?$`).
 
-**Ответ** — такая же форма, как у варианта `GET`, но `analyze` всегда заполнен.
+**Ответ** — такая же форма, как у варианта `GET`, но `analyze` всегда заполнен и возвращается новый `share_id`.
 
 **Ошибки**
 
@@ -865,7 +1237,7 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 
 #### `POST /analyze/pgn`
 
-Классифицировать произвольный PGN (не привязанный к конкретному сайту/игроку), используя результаты Stockfish, присланные клиентом. Полезно для анализа партий, полученных не через этот API — например, импортированных или вставленных вручную PGN. Результаты здесь **не кэшируются**.
+Классифицировать произвольный PGN (не привязанный к конкретному сайту/игроку), используя результаты Stockfish, присланные клиентом. Полезно для анализа партий, полученных не через этот API — например, импортированных или вставленных вручную PGN. Результат не попадает в обычный кэш анализа партий, но для него создаётся Redis-snapshot на 3 дня, доступный через share link.
 
 **Тело запроса** — [`AnalyzeAndPgnPayload`](#analyzepayload--analyzeandpgnpayload)
 
@@ -886,7 +1258,12 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 **Ответ**
 
 ```json
-{ "analyze": [ "...объекты классификации ходов" ] }
+{
+  "game": { "...": "объект Game, построенный из PGN" },
+  "profiles": { "white": null, "black": null },
+  "analyze": [ "...объекты классификации ходов" ],
+  "share_id": "a1B2c3D4e"
+}
 ```
 
 **Ошибки**
@@ -924,7 +1301,7 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 ```
 
 - `evaluation` — либо число в пешках (сантипешечная оценка / 100), либо строка вида `"# 3"` / `"# -0"` для форсированного мата.
-- `accuracy` — накопительное среднее (формула на основе win% в стиле Chess.com) до этого хода включительно, для стороны, только что сходившей.
+- `accuracy` — накопительное среднее (формула просадки win-процентов) до этого хода включительно, для стороны, только что сходившей.
 - `efficiency` — показатель эффективности отдельного хода (`0`–`100`, см. [Efficiency](#efficiency-кто-на-самом-деле-сильнее-играет-прямо-сейчас)), объединяющий качество хода и затраченное на него время; `null`, если для этого хода в PGN нет данных о часах.
 - `move_time` / `time_before` — сколько секунд потрачено на ход и сколько времени было на часах до него (из тегов `[%clk ...]` PGN, либо базовое время контроля для самого первого хода каждой стороны); оба `null` без данных о часах.
 - `eff_white` / `eff_black` — скользящее среднее последних 3 значений эффективности для белых/чёрных соответственно — читаются вместе как «eval-бар эффективности», показывающий, кто сейчас играет сильнее, независимо от сырой оценки движка. В каждой записи обновляется только поле стороны, которая только что сходила; второе несёт предыдущее значение дальше.
@@ -1076,6 +1453,30 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
   "points": [
     { "timestamp": 0, "value": 0, "rating": 0, "games": 0 }
   ]
+}
+```
+
+#### `PlayerCard`
+```json
+{
+  "site": "chesscom",
+  "username": "string",
+  "avatar": "https://... | null",
+  "country": "US | null",
+  "title": "GM | null"
+}
+```
+
+#### Ответ анализа
+```json
+{
+  "game": { "...": "Game" },
+  "profiles": {
+    "white": { "...": "PlayerCard или null" },
+    "black": { "...": "PlayerCard или null" }
+  },
+  "analyze": [ "...объекты классификации ходов" ],
+  "share_id": "a1B2c3D4e или null"
 }
 ```
 

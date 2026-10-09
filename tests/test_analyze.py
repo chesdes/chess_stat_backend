@@ -18,6 +18,76 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(len(result), 2)
         self.assertEqual(result[0]["move"], "e2e4")
 
+    def test_move_accuracy_one_sided(self):
+        acc = self.analyzer._get_move_accuracy
+        # Improvements score 100 from the mover's view.
+        self.assertEqual(acc(100, 0, 0, False), 100.0)    # white gains
+        self.assertEqual(acc(-100, 0, 1, False), 100.0)   # black gains
+        self.assertEqual(acc(0, None, 0, False), 100.0)   # first move, custom FEN
+        self.assertEqual(acc(-5000, 300, 0, True), 100.0)  # delivered mate
+        # A 100cp pawn mistake (~9.9pp win% drop) costs ~65 points (strict k=0.10).
+        self.assertAlmostEqual(acc(0, 100, 0, False), 35.3, places=1)
+        self.assertAlmostEqual(acc(100, 0, 1, False), 35.3, places=1)
+        # Mate scores saturate win% at ~100: mate vs mate is not a mistake.
+        self.assertEqual(acc(8000, 14000, 0, False), 100.0)
+
+    def test_side_accuracy_is_plain_mean(self):
+        side_acc = self.analyzer._get_side_accuracy
+        self.assertEqual(side_acc([]), 100.0)
+        self.assertEqual(side_acc([100.0] * 20), 100.0)
+        self.assertEqual(side_acc([100.0] * 54), 100.0)
+        # No grind penalty: the mean is the accuracy, any game length.
+        dirty = [100.0] * 44 + [50.0] * 10
+        self.assertAlmostEqual(side_acc(dirty), sum(dirty) / len(dirty), places=5)
+        self.assertAlmostEqual(side_acc([100.0] * 10 + [50.0] * 10), 75.0)
+
+    def test_accuracy_punishes_single_blunder(self):
+        pgn = (
+            '[SetUp "1"]\n'
+            '[FEN "4k3/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQ - 0 1"]\n'
+            '\n'
+            '1. e4 e5 2. Qh5 Ke7'
+        )
+        analysis = [
+            {"info": {"type": "cp", "value": 30}, "best_move": "e2e4"},
+            {"info": {"type": "cp", "value": 25}, "best_move": "e7e5"},
+            {"info": {"type": "cp", "value": 60}, "best_move": "d1h5"},
+            {"info": {"type": "cp", "value": 500}, "best_move": "e8e7"},
+        ]
+        result = self.analyzer.calculate_info(analysis, pgn)
+
+        white_acc = result[2]["accuracy"]
+        black_acc = result[3]["accuracy"]
+        self.assertEqual(white_acc, 100.0)
+        # ...Ke7?? drops White win% 56 -> 88 for White (~32pp mover drop):
+        # one move ~1.0, mean ~50.5.
+        self.assertLess(black_acc, 60.0)
+        self.assertGreater(black_acc, 45.0)
+
+    def test_accuracy_winner_above_loser_on_decisive_blunder(self):
+        # Property: a decisive last-move blunder that loses the game must
+        # leave the winner's accuracy above the loser's.
+        pgn = (
+            '[SetUp "1"]\n'
+            '[FEN "4k3/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQ - 0 1"]\n'
+            '\n'
+            '1. e4 e5 2. Qh5 Ke7'
+        )
+        analysis = [
+            {"info": {"type": "cp", "value": 30}, "best_move": "e2e4"},
+            {"info": {"type": "cp", "value": 25}, "best_move": "e7e5"},
+            {"info": {"type": "cp", "value": 60}, "best_move": "d1h5"},
+            {"info": {"type": "cp", "value": 500}, "best_move": "e8e7"},
+        ]
+        result = self.analyzer.calculate_info(analysis, pgn)
+        self.assertGreater(result[2]["accuracy"], result[3]["accuracy"])
+
+    def test_accuracy_all_best_is_hundred_without_seed(self):
+        result = self.analyzer.calculate_info(self.analysis, self.pgn)
+
+        self.assertEqual(result[0]["accuracy"], 100.0)
+        self.assertEqual(result[1]["accuracy"], 100.0)
+
     def test_efficiency_none_without_clocks(self):
         result = self.analyzer.calculate_info(self.analysis, self.pgn)
 

@@ -13,13 +13,14 @@ from .admin import (
 )
 from .game import Game, GamesPage, Player
 from .graphs import PerformanceGraph
-from .profile import PlayerProfile
+from .profile import PlayerCard, PlayerProfile
 from .stats import Stats, TimeControl
 
 __all__ = [
 	"Player",
 	"Game",
 	"GamesPage",
+	"PlayerCard",
 	"PlayerProfile",
 	"Stats",
 	"TimeControl",

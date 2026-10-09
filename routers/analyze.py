@@ -15,6 +15,25 @@ router = APIRouter(
 analysis_service = AnalysisService()
 
 @router.get(
+    "/shared/{share_id}",
+    summary="Get analysis by share link",
+    response_description="The shared game and its cached analysis",
+)
+async def get_shared_analyze(request: Request, share_id: str):
+    """Return a previously shared analysis snapshot while its cache entry is valid."""
+    try:
+        return await analysis_service.get_shared_analysis(share_id, request=request)
+    except GameNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except UpstreamError:
+        raise
+    except Exception:
+        logger.exception("Failed to load shared analysis")
+        raise HTTPException(status_code=404, detail="Unable to load shared analysis")
+
+@router.get(
     "/last/{site}/{username}/{index}",
     summary="Get cached analysis for a recent game",
     response_description="The selected game and cached analysis, or null when not analyzed",
