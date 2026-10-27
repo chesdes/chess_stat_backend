@@ -33,13 +33,13 @@ async def get_performance(games: list[Game], username: str):
             ops.append(i.black.rating)
             match i.white.result:
                 case "win": score += 1
-                case "loss": score += 0.5
+                case "loss": score += 0
                 case "draw": score += 0.5
         elif i.black.username.lower() == username:
             ops.append(i.white.rating)
             match i.black.result:
                 case "win": score += 1
-                case "loss": score += 0.5
+                case "loss": score += 0
                 case "draw": score += 0.5
     return _performance_rating(ops, score)
 

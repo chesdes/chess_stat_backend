@@ -153,7 +153,8 @@ class Analyzer:
             evaluation = self._format_evaluation(info, board.turn)
             expected_score = self._expected_score(info, evaluation, board.turn)
 
-            if info["value"] != 0 and last_expected is not None:
+            is_mate_delivered = info["type"] == "mate" and info["value"] == 0
+            if not is_mate_delivered and last_expected is not None:
                 diff = abs(last_expected - expected_score)
             else:
                 diff = 0
@@ -173,7 +174,6 @@ class Analyzer:
             )
 
             if not is_theory:
-                is_mate_delivered = info["type"] == "mate" and info["value"] == 0
                 accuracies[side].append(
                     self._get_move_accuracy(cpawns, last_cp, white, is_mate_delivered)
                 )

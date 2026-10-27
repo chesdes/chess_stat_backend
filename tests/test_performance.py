@@ -31,6 +31,17 @@ class PerformanceTests(unittest.TestCase):
 
         self.assertGreater(result, 1500)
 
+    def test_loss_is_counted_for_white_player(self):
+        result = asyncio.run(get_performance([self.make_game("loss", "win")], "player"))
+
+        self.assertLess(result, 1500)
+
+    def test_loss_scores_below_draw(self):
+        draw = asyncio.run(get_performance([self.make_game("draw", "draw")], "player"))
+        loss = asyncio.run(get_performance([self.make_game("loss", "win")], "player"))
+
+        self.assertLess(loss, draw)
+
 
 if __name__ == "__main__":
     unittest.main()
