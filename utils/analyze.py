@@ -335,10 +335,10 @@ class Analyzer:
             result = "retreat"
 
         if not is_best:
-            if is_miss:
-                result = "miss"
             if allows_mate:
                 result = "retreat"
+            if is_miss:
+                result = "miss"
 
         return "theory" if is_theory else result
 
@@ -368,10 +368,10 @@ class Analyzer:
         if is_brilliant:
             result = "brilliant"
         elif not is_best:
-            if is_miss:
-                result = "miss"
             if allows_mate:
                 result = "blunder"
+            if is_miss:
+                result = "miss"
 
         return "theoretical" if is_theory else result
 
