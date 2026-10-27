@@ -6,7 +6,8 @@ _session: aiohttp.ClientSession | None = None
 logger = logging.getLogger(__name__)
 RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 MAX_RETRIES = 2
-RETRY_DELAYS = (0.25, 0.5)
+RETRY_DELAYS = (4.0, 8.0)
+CHESSCOM_USER_AGENT = "chess-stat.ru-api/1.0 (+mailto:chdsproject@gmail.com)"
 
 class UpstreamError(Exception):
     pass
@@ -28,7 +29,7 @@ async def init_http_client(timeout: int = 10):
     if _session is None or _session.closed:
         _session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=timeout),
-            headers={"User-Agent": "chess-stats-api/1.0"},
+            headers={"User-Agent": CHESSCOM_USER_AGENT},
         )
 
 async def close_http_client():
@@ -40,7 +41,7 @@ async def close_http_client():
 async def get_json(url: str, headers: dict | None = None, timeout: int = 10):
     await init_http_client(timeout=timeout)
     request_headers = headers or {}
-    request_headers.setdefault("User-Agent", "chess-stats-api/1.0")
+    request_headers.setdefault("User-Agent", CHESSCOM_USER_AGENT)
 
     for attempt in range(MAX_RETRIES + 1):
         try:

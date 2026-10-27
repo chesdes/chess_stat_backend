@@ -13,6 +13,12 @@ class MoveResult(BaseModel):
         pattern=r"^[a-h][1-8][a-h][1-8][qrbnQRBN]?$",
         description="Best move already selected by Stockfish, in UCI notation",
     )
+    accept_info: Optional[EvalInfo] = Field(
+        None,
+        description=(
+            "Stockfish evaluation (White's point of view) after the opponent captures the piece this move leaves hanging; only sent to candidates for brilliant moves."
+        ),
+    )
 
 class AnalyzePayload(BaseModel):
     results: List[MoveResult] = Field(

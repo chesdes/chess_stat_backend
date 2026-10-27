@@ -9,7 +9,7 @@ from config import ANALYSIS_CONCURRENCY
 from models import AnalyzePayload, AnalyzeAndPgnPayload, Game, Player, PlayerCard
 from parsers import get_parser
 from starlette.requests import Request
-from utils import Analyzer, RedisClient
+from utils import Analyzer, RedisClient, normalize_pgn
 
 class GameNotFoundError(ValueError):
     pass
@@ -252,6 +252,7 @@ class AnalysisService:
 
     @staticmethod
     def _game_from_pgn(pgn_text: str) -> Game:
+        pgn_text = normalize_pgn(pgn_text)
         game_node = chess.pgn.read_game(StringIO(pgn_text))
         if game_node is None:
             raise ValueError("Failed to parse PGN text.")

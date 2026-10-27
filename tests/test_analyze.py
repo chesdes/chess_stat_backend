@@ -1,6 +1,7 @@
 import unittest
 
-from utils.analyze import Analyzer
+from services import AnalysisService
+from utils.analyze import Analyzer, normalize_pgn
 
 
 class AnalyzerTests(unittest.TestCase):
@@ -152,6 +153,53 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(parse("180"), (180.0, 0.0))
         self.assertEqual(parse("-"), (None, 0.0))
         self.assertEqual(parse("garbage"), (None, 0.0))
+        # Correspondence controls are per move, never a game clock.
+        self.assertEqual(parse("1/86400"), (None, 0.0))
+        self.assertEqual(parse("1/259200"), (None, 0.0))
+        self.assertEqual(parse("1 day"), (None, 0.0))
+
+    def test_correspondence_ignores_clocks_and_efficiency(self):
+        # Chess.com daily PGNs carry %clk comments whose values are not a
+        # remaining game clock; no time/efficiency metrics may be derived.
+        pgn = (
+            '[Event "daily"]\n[TimeControl "1/259200"]\n\n'
+            '1. e4 {[%clk 0:07:10.3]} e5 {[%clk 0:56:28.2]} '
+            '2. Nf3 {[%clk 0:03:27.9]} Nc6 {[%clk 0:17:53.2]}'
+        )
+        analysis = self.analysis + [
+            {"info": {"type": "cp", "value": 10}, "best_move": "g1f3"},
+            {"info": {"type": "cp", "value": 5}, "best_move": "b8c6"},
+        ]
+        result = self.analyzer.calculate_info(analysis, pgn)
+
+        self.assertEqual(len(result), 4)
+        for item in result:
+            self.assertIsNone(item["efficiency"])
+            self.assertIsNone(item["move_time"])
+            self.assertIsNone(item["time_before"])
+            self.assertIsNone(item["eff_white"])
+            self.assertIsNone(item["eff_black"])
+
+    def test_correspondence_detected_from_days_header(self):
+        pgn = (
+            '[Event "daily"]\n[TimeControl "1 day"]\n\n'
+            '1. e4 {[%clk 0:07:10]} e5 {[%clk 0:56:28]}'
+        )
+        result = self.analyzer.calculate_info(self.analysis, pgn)
+
+        self.assertIsNone(result[0]["efficiency"])
+        self.assertIsNone(result[0]["move_time"])
+
+    def test_live_game_with_time_control_keeps_efficiency(self):
+        # The correspondence guard must not affect regular live games.
+        pgn = (
+            '[Event "t"]\n[TimeControl "180+2"]\n\n'
+            '1. e4 {[%clk 0:02:58]} e5 {[%clk 0:02:57]}'
+        )
+        result = self.analyzer.calculate_info(self.analysis, pgn)
+
+        self.assertAlmostEqual(result[0]["move_time"], 4.0)
+        self.assertIsNotNone(result[0]["efficiency"])
 
     def test_calculate_info_rejects_mismatched_result_count(self):
         with self.assertRaisesRegex(ValueError, "match"):
@@ -262,6 +310,42 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(result[0]["move"], "g2g4")
         self.assertEqual(result[-1]["move"], "f3f1")
         self.assertIn("move_classify", result[0])
+
+
+class NormalizePgnTests(unittest.TestCase):
+    # Real PGN vs the same text JSON-escaped (literal backslash-n / backslash-quote).
+    REAL = '[Event "test"]\n[White "a"]\n\n1. e4 e5'
+    ESCAPED = '[Event \\"test\\"]\\n[White \\"a\\"]\\n\\n1. e4 e5'
+    ANALYSIS = [
+        {"info": {"type": "cp", "value": 0}, "best_move": "e2e4"},
+        {"info": {"type": "cp", "value": 0}, "best_move": "e7e5"},
+    ]
+
+    def test_unescapes_json_escaped_pgn(self):
+        self.assertEqual(normalize_pgn(self.ESCAPED), self.REAL)
+
+    def test_leaves_real_multiline_pgn_untouched(self):
+        self.assertEqual(normalize_pgn(self.REAL), self.REAL)
+
+    def test_strips_json_string_wrapper(self):
+        wrapped = '"' + self.ESCAPED + '"'
+        self.assertEqual(normalize_pgn(wrapped), self.REAL)
+
+    def test_does_not_touch_backslash_inside_a_real_pgn(self):
+        # A backslash inside a name must survive when real newlines are present.
+        pgn = '[White "a\\nb"]\n\n1. e4 e5'
+        self.assertEqual(normalize_pgn(pgn), pgn)
+
+    def test_calculate_info_accepts_escaped_pgn(self):
+        result = Analyzer().calculate_info(self.ANALYSIS, self.ESCAPED)
+
+        self.assertEqual([row["move"] for row in result], ["e2e4", "e7e5"])
+
+    def test_game_from_pgn_reads_escaped_headers(self):
+        game = AnalysisService._game_from_pgn(self.ESCAPED)
+
+        self.assertEqual(game.site, "pgn")
+        self.assertEqual(game.white.username, "a")
 
 
 if __name__ == "__main__":

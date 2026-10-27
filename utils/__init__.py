@@ -6,7 +6,7 @@ from .http_client import (
 	get_json,
 	init_http_client,
 )
-from .analyze import Analyzer
+from .analyze import Analyzer, normalize_pgn
 from .visitor_names import visitor_name
 from .openings import find_closest_opening
 from .redis_client import RedisClient
@@ -20,6 +20,7 @@ __all__ = [
 	"get_json",
 	"init_http_client",
 	"Analyzer",
+	"normalize_pgn",
 	"visitor_name",
 	"find_closest_opening",
 	"RedisClient",
