@@ -48,22 +48,22 @@ All routes below are mounted under the `/api` root path in production (`root_pat
 - **PostgreSQL** (via `asyncpg`) in production for request/traffic statistics, **SQLite** (via `aiosqlite`) as the lightweight/test backend — same codebase, driver picked from `DATABASE_URL`
 - [SQLAlchemy](https://www.sqlalchemy.org/) 2.0 (async ORM, `DeclarativeBase` models)
 - [Alembic](https://alembic.sqlalchemy.org/) for schema migrations, run automatically on container start (`entrypoint.sh`)
-- [Redis](https://redis.io/) (via `redis-py`'s async client) — caches computed game analyses (3-day TTL) and backs the admin login rate-limiter/ban list
+- [Redis](https://redis.io/) (via `redis-py`'s async client) — caches computed game analyses and shared snapshots (3-day TTL), caches gzip-compressed Chess.com archives (see [Caching](#caching-of-upstream-data)), and backs the admin login rate-limiter/ban list
 
 **Chess logic**
-- [`python-chess`](https://python-chess.readthedocs.io/) for PGN parsing, board/move handling, Chess960/custom-FEN support
+- [`python-chess`](https://python-chess.readthedocs.io/) for PGN parsing, board/move handling, Chess960/custom-FEN support, and the static exchange evaluation used for brilliancy detection
 - [Stockfish](https://stockfishchess.org/) engine (bundled into the Docker image at build time, pinned by version/SHA256, multi-arch amd64/arm64) driven through the [`stockfish`](https://pypi.org/project/stockfish/) Python wrapper — used only for server-computed evaluations where applicable; client-submitted evaluations are the primary analysis path (see [Concepts](#concepts))
 - A bundled [ECO opening database](https://en.wikipedia.org/wiki/Encyclopaedia_of_Chess_Openings) (categories A–E, fetched at Docker build time) for opening detection
 
 **HTTP & integration**
-- [`aiohttp`](https://docs.aiohttp.org/) as the async HTTP client for calling the Chess.com Published Data API, with retry/backoff on transient errors (408/425/429/5xx) and typed upstream-error exceptions
+- [`aiohttp`](https://docs.aiohttp.org/) as the async HTTP client for calling the Chess.com Published Data API, with retry/backoff on transient errors (408/425/429/5xx and timeouts) and typed upstream-error exceptions
 - [PyJWT](https://pyjwt.readthedocs.io/) for signing/verifying admin bearer tokens (HS256)
 
 **Infrastructure**
 - Docker multi-stage build (a dedicated `stockfish` build stage, then the Python app stage), runs as a non-root user
 - CORS via Starlette's `CORSMiddleware`, origins configurable through `CORS_ORIGINS`
-- A custom `StatsMiddleware` records every request (path, endpoint, status, duration, source classification, hashed IP, cache-hit/move-count metadata) for the admin dashboard, with bot/scanner detection and a background retention loop that prunes old rows
-- Structured around FastAPI `APIRouter`s per domain (`profile`, `games`, `graphs`, `analyze`, `admin`), a thin `services/` layer, and `parsers/` implementing a `BaseParser` interface per chess site (currently `chesscom`)
+- A custom `StatsMiddleware` records every request (path, endpoint, status, duration, source classification, hashed IP, cache-hit/move-count metadata, truncated error body for failed requests) for the admin dashboard, with bot/scanner detection and a background retention loop that prunes old rows
+- Structured around FastAPI `APIRouter`s per domain (`profile`, `games`, `graphs`, `analyze`, `admin`), a thin `services/` layer, `features/` (performance rating and graph computation), `utils/` (HTTP client, Redis client, archive cache, analyzer, openings) and `parsers/` implementing a `BaseParser` interface per chess site (currently `chesscom`)
 
 **Testing**
 - Python's built-in `unittest` (with `unittest.mock`) — no pytest dependency; async tests driven via `asyncio.run(...)`
@@ -84,7 +84,7 @@ Requesting an unsupported site returns a `404`.
 
 Running Stockfish is expensive, so this API does **not** run a chess engine itself for every request. Instead:
 
-1. The client (browser) runs Stockfish locally over a game's moves and produces one evaluation (`{type, value}`) plus a `best_move` per ply.
+1. The client (browser) runs Stockfish locally over a game's moves and produces one evaluation (`{type, value}`) plus a `best_move` per ply. For moves that look like possible brilliancies (a sacrifice), the client may also send `accept_info` — the evaluation after the opponent captures the piece the move leaves hanging.
 2. The client sends those precomputed results to `POST /analyze/pgn` or `POST /analyze/last/{site}/{username}/{index}`.
 3. The server turns raw evaluations into per-move **classifications** (best / excellent / good / inaccuracy / mistake / blunder / great / brilliant / miss / theory, plus chess-stat.ru's own `chess_stat` classifier), an **accuracy** score, an **efficiency** score (see below), and **opening** detection — and caches the result in Redis for game-analysis endpoints.
 
@@ -93,11 +93,13 @@ Running Stockfish is expensive, so this API does **not** run a chess engine itse
 Two parallel classifiers are returned per move under `move_classify`:
 
 - `chesscom` — mirrors Chess.com's classification vocabulary (`best`, `excellent`, `good`, `inaccuracy`, `mistake`, `blunder`, `great`, `brilliant`, `miss`, `theoretical`), elo-adjusted thresholds, sacrifice/brilliancy detection.
-- `chess_stat` — **chess-stat.ru's own classification system** (`advance`, `steady`, `retreat`, `miss`, `theory`). Where Chess.com's nine-tier scale can make it harder to judge how much a move actually mattered, `chess_stat` deliberately collapses move quality into three clear buckets: good moves (`advance`), moves that were slightly suboptimal but not damaging — a better move existed (`steady`), and genuinely bad moves (`retreat`). `miss` is separate from these — it flags a missed opportunity: the opponent just made a mistake that handed a significant advantage, and the player failed to capitalize on it. `theory` covers known opening moves. The goal is to make it easier for a player to see, at a glance, exactly where their thinking broke down in a game, rather than getting lost in fine-grained distinctions between near-equivalent move qualities.
+- `chess_stat` — **chess-stat.ru's own classification system** (`advance`, `steady`, `retreat`, `miss`, `theory`). Where Chess.com's nine-tier scale can make it harder to judge how much a move actually mattered, `chess_stat` deliberately collapses move quality into three clear buckets: good moves (`advance`), moves that were slightly suboptimal but not damaging — a better move existed (`steady`), and genuinely bad moves (`retreat`). `miss` is separate from these — it flags a missed opportunity: the opponent just made a mistake that handed a significant advantage (or a forced mate), and the player failed to capitalize on it. `theory` covers known opening moves. The goal is to make it easier for a player to see, at a glance, exactly where their thinking broke down in a game, rather than getting lost in fine-grained distinctions between near-equivalent move qualities.
+
+Both classifiers share two overrides for moves that are not the engine's best move: a move that **misses** an opportunity is labelled `miss`, and a move that **allows a forced mate** (the opponent has a mate after it that did not exist before) is labelled `retreat` (`chess_stat`) / `blunder` (`chesscom`). The exact conditions are in [Classification thresholds](#6-classification-thresholds).
 
 ### Opening detection
 
-The first move sequence of a game is matched against an ECO opening database (categories A–E) to detect the opening name and mark "theory" moves that match known opening lines.
+The first move sequence of a game is matched against an ECO opening database (categories A–E) to detect the opening name and mark "theory" moves that match known opening lines. Games with a non-standard starting position (Chess960, custom FEN) skip opening detection.
 
 ### Efficiency: who is playing better *right now*
 
@@ -111,6 +113,14 @@ For each move, efficiency combines two things:
 These are combined into a single per-move score in `[0, 100]`, then smoothed into `eff_white` / `eff_black`: a rolling average over each side's last **3** moves (`EFF_WINDOW_PER_SIDE`), so the number reflects *recent form in the position*, not a single lucky or unlucky move. `efficiency` requires a clock in the PGN (`[%clk ...]` annotations); without clock data it — and `eff_white`/`eff_black` — is `null`.
 
 **Reading it as an eval bar:** plotting `eff_white` against `eff_black` over the course of a game gives a second bar alongside the engine evaluation bar. The engine bar says who's ahead; the efficiency bar says who's currently under pressure. A telling pattern: White is worse by engine evaluation, but Black — despite standing better — is burning large amounts of time each move (the position is hard, Black doesn't yet feel the win), while White responds quickly and accurately. Here White's efficiency is higher than Black's even though White's evaluation is lower — a signal that Black is more likely to err as the position continues, and White has a realistic practical path back into (or to) a winning position.
+
+### Caching of upstream data
+
+Chess.com monthly archives and archive lists are cached in Redis as gzip-compressed JSON, so repeated profile, games, graph and analysis requests do not hit the Chess.com API again:
+
+- **Past months** are immutable on Chess.com, so they use a sliding TTL (default 3 days) that is refreshed on every read.
+- **The current month** gets a short fixed TTL (default 120 s) with no refresh.
+- **The archive list** has a fixed TTL (default 10 min).
 
 ---
 
@@ -128,15 +138,15 @@ Win-probability mapping (White-relative):
 
 $
 w(s) = \frac{1}{1 + 10^{-s / 4}}, \qquad
-w_{\text{mate}}(m) = \begin{cases} 1.0, & m > 0 \\ 0.0, & m \le 0 \end{cases}
+w_{\text{mate}}(m) = \begin{cases} 1.0, & m > 0 \ \text{or}\ m = 0 \ \text{and Black is checkmated} \\ 0.0, & \text{otherwise} \end{cases}
 $
 
 In plain terms:
 - $s = 0 \Rightarrow w = 0.5$ (equal)
 - $s = +1 \Rightarrow w \approx 0.64$
 - $s = +2 \Rightarrow w \approx 0.76$
-- White can deliver mate in $m$ moves — $1$
-- White is getting mated in $m$ moves — $0$.
+- White can deliver mate in $m$ moves (or has just mated) — $1$
+- White is getting mated in $m$ moves (or has just been mated) — $0$.
 
 ### 2. Move swing $\Delta w$ (`diff_expected`)
 
@@ -179,19 +189,23 @@ In plain terms:
 - $D = 10 \Rightarrow acc_i \approx 34.8$
 - $D = 20 \Rightarrow acc_i \approx 10.8$
 
+Mate evaluations enter this formula as very large centipawn values, so the win percentage saturates near 0/100 and "mate vs. mate" is not treated as a mistake. The first move of a game from a custom starting position has no previous evaluation and scores 100.
+
+**Side accuracy.** The `accuracy` value attached to each move is the plain arithmetic mean of the per-move accuracies of the side that just moved, over all of that side's moves so far. Opening-theory moves are excluded from the mean, and a side with no counted moves yet has accuracy 100. There is no length-based penalty or weighting.
+
 The core idea is based on this [article](https://lichess.org/forum/team-zNAEJBNN/RxgX6G2C) about the Lichess accuracy metric.
 
 ### 4. Efficiency
 
 This is an original metric intended to evaluate a position from a more *human* perspective. Combining engine evaluation with time spent can show how comfortable a player really is in a position: the engine may consider White's position winning, but if White spends a very long time finding the right moves, is the position actually comfortable for the player? Efficiency is designed to answer that question and show who has been playing "better" over the last few moves, while also indicating the likely direction of the game.
 
-PGN clock annotations are required; without them the metric cannot be calculated.
+PGN clock annotations are required; without them the metric cannot be calculated. Correspondence (`daily`) games are excluded entirely.
 
 $$
 t_{move} = \max\bigl(0,\ t_{before} - t_{after} + inc\bigr)
 $$
 
-$t_{before}$ is the mover's time before the move (the previous clock value for that color, or the base time from the `TimeControl` header for that side's first move), $t_{after}$ is the time after the move, and $inc$ is the increment in seconds.
+$t_{before}$ is the mover's time before the move (the previous clock value for that color, or the base time from the `TimeControl` header for that side's first move; if the header has no usable base time, the first move of each side has no efficiency), $t_{after}$ is the time after the move, and $inc$ is the increment in seconds.
 
 $$
 f = \min\!\left(\frac{t_{move}}{t_{before}},\ 2.0\right), \qquad
@@ -224,30 +238,47 @@ Solved by binary search on $[\,0.8 \cdot \min R_j,\ 1.2 \cdot \max R_j\,]$ to $0
 
 ### 6. Classification thresholds
 
-**`chess_stat`** (own system):
+**`chess_stat`** (own system). Base class by $\Delta w$:
 
 | Class | Condition |
 |---|---|
 | `advance` | played `best_move`, or $\Delta w \le 0.04$ |
 | `steady` | $\Delta w \le 0.12$ |
-| `miss` | $\Delta w \ge 0.09$ **and** previous move had $\Delta w_{prev} > 0.12$ (opponent just blundered, you didn't punish) |
-| `retreat` | otherwise (large $\Delta w$ without the `miss` context) |
-| `theory` | in opening book line |
+| `retreat` | larger $\Delta w$ |
+| `miss` | the move fails to capitalize on the opponent's mistake (see [Miss](#miss-missed-opportunity)) |
+| `theory` | in opening book line (wins over everything) |
 
 **`chesscom`** (Chess.com vocabulary, Elo-adjusted; $bonus = \frac{4000 - Elo}{4000} \cdot 0.05$, so weaker players get slightly wider "good" windows):
 
-| Class | Condition on $\Delta w$ |
+| Class | Condition |
 |---|---|
 | `best` | played `best_move` or $\Delta w = 0$ |
 | `excellent` | $\Delta w \le 0.02 + bonus$ |
 | `good` | $\Delta w \le 0.05 + bonus$ |
 | `inaccuracy` | $\Delta w \le 0.10 + bonus$ |
 | `mistake` | $\Delta w \le 0.20 + bonus$ |
-| `blunder` | larger |
+| `blunder` | larger $\Delta w$ |
 | `great` | `best` + evaluation swing compared with the player's previous move $> (100 + Elo/40)$ centipawns in the player's favor |
-| `brilliant` | `best` + material sacrifice (SEE-like capture chain $< 0$, attacking piece worth more than the captured piece) that preserves or increases the advantage |
-| `miss` | `blunder` immediately after an opponent's `blunder` (the opportunity was there, but both missed it) |
+| `brilliant` | a sacrifice that keeps the position (see [Brilliant](#brilliant-moves)); does not have to be the engine's top move |
+| `miss` | non-best move that fails to capitalize on the opponent's mistake (see [Miss](#miss-missed-opportunity)) |
 | `theoretical` | in opening book line |
+
+#### Miss (missed opportunity)
+
+A move that is not the engine's best is a `miss` in either of two cases:
+
+- **Missed advantage.** Let $b$ be the mover's expected score before the opponent's last move, $o$ after it, and $a$ after the mover's own move (all from the mover's point of view). It is a miss when the opponent's move raised the mover's score by at least $0.10$ to at least $0.60$ ($o - b \ge 0.10$, $o \ge 0.60$), but the mover's reply brought it back to roughly where it started: $b - a < 0.10$ and $a \le b + 0.03$. Not available when the starting position is custom (no baseline).
+- **Missed mate.** The mover had a forced mate on the previous ply, the reply no longer keeps a mate, yet the mover still stands at $\ge 0.60$ expected score.
+
+#### Brilliant moves
+
+A move is `brilliant` when it is not a book move and all of the following hold (centipawn values are from the mover's point of view; the expected-score scale here is the Elo-style $1/(1+10^{-cp/400})$):
+
+- the position offers at least 3 legal moves (5 when in check);
+- the move gives away at most $0.12$ expected score compared with the evaluation before it, and does not lose or delay an existing forced mate;
+- the position after it is not worse than $-100$ cp for the mover;
+- if the mover was already winning (more than $+500$ cp without a forced mate), only a "mate trap" sacrifice counts — `accept_info` shows that capturing the offered piece lets the mover mate — and the move must risk at least 200 cp of material;
+- otherwise the move qualifies if it **creates a new hanging piece** worth at least 200 cp net of what it captured (static exchange evaluation) — except that a quiet move (no capture, no check) made while the evaluation is in the $+400…+500$ cp zone does not count as a sacrifice this way — or, in any case, if it **ignores a threat**: `accept_info` shows that accepting the offered material gains the opponent at least 600 cp (or a mate), the move risks at least 200 cp, and a non-sacrificial alternative existed.
 
 ---
 
@@ -303,11 +334,11 @@ Paginated game history, for infinite-scroll style UIs without downloading a play
 | Name | Type | Default | Constraints | Description |
 |---|---|---|---|---|
 | `limit` | int | `10` | `1 ≤ limit ≤ MAX_PAGE_SIZE` (default cap 50) | Games per page |
-| `offset` | int | `0` | `0 ≤ offset ≤ MAX_PAGE_OFFSET` | Games to skip |
+| `offset` | int | `0` | `0 ≤ offset ≤ MAX_PAGE_OFFSET` (`MAX_GAMES − 10`) | Games to skip |
 
 **Response** — [`GamesPage`](#gamespage)
 
-`total_pages` is only known (and populated) once the last page has been reached; otherwise it's `null` and `has_more` is `true`, since the backend never scans a player's entire archive just to count games.
+`total_pages` is only known (and populated) once the last page has been reached; otherwise it's `null` and `has_more` is `true`, since the backend never scans a player's entire archive just to count games. Pagination stops at `MAX_GAMES`: a page that reaches that depth is reported as the last one.
 
 **Errors:** `404` if the player doesn't exist.
 
@@ -319,7 +350,7 @@ Performance rating is computed with the standard iterative (binary-search) formu
 
 #### `GET /graphs/performance/{site}/{username}/{days}`
 
-Rating/performance points over a period, bucketed daily (for `days < 30`) or in roughly `days / 30` groupings otherwise.
+Rating/performance points over a period, bucketed daily (for `days < 30`) or in roughly `days / 30`-day groupings otherwise. Buckets are aligned to 03:00 UTC. A bucket without games repeats the previous point's `value` and `rating` with `games: 0`.
 
 **Path parameters**
 
@@ -386,7 +417,7 @@ Fetch a previously cached analysis for a recent game, without submitting new Sto
 }
 ```
 
-`profiles` contains compact player cards embedded in the analysis response, so clients do not need separate profile requests. When cached analysis is available, `share_id` can be used to retrieve the same snapshot through [`GET /analyze/shared/{share_id}`](#get-analyzesharedshare_id).
+`profiles` contains compact player cards embedded in the analysis response, so clients do not need separate profile requests; they are loaded best-effort and a side whose card could not be loaded is `null`. When cached analysis is available, `share_id` can be used to retrieve the same snapshot through [`GET /analyze/shared/{share_id}`](#get-analyzesharedshare_id) — if the cached analysis has no live snapshot yet, one is created on this call.
 
 **Errors:** `404` if the player or that game index doesn't exist.
 
@@ -394,7 +425,7 @@ Fetch a previously cached analysis for a recent game, without submitting new Sto
 
 #### `GET /analyze/shared/{share_id}`
 
-Retrieve a previously generated analysis snapshot by its share ID. Snapshots are stored in Redis for the same 3-day TTL as regular game-analysis cache entries.
+Retrieve a previously generated analysis snapshot by its share ID. Snapshots are stored in Redis for the same 3-day TTL as regular game-analysis cache entries. Snapshots created before player cards were embedded return `null` profiles.
 
 **Path parameters**
 
@@ -416,13 +447,13 @@ Retrieve a previously generated analysis snapshot by its share ID. Snapshots are
 }
 ```
 
-**Errors:** `404` if the share ID is invalid, expired, or not found; `422` if the share ID format is invalid.
+**Errors:** `404` if the share ID is not found or expired; `422` if the share ID format is invalid.
 
 ---
 
 #### `POST /analyze/last/{site}/{username}/{index}`
 
-Submit client-computed Stockfish results for a specific recent game; the server calculates classifications, caches them (3-day TTL), and returns them.
+Submit client-computed Stockfish results for a specific recent game; the server calculates classifications, caches them (3-day TTL), and returns them. Every call mints a new `share_id`; links from earlier calls keep working until they expire.
 
 **Path parameters:** same as the `GET` variant above.
 
@@ -440,6 +471,7 @@ Submit client-computed Stockfish results for a specific recent game; the server 
 - `results` must contain exactly one entry per ply (half-move) in the game's PGN.
 - `info.type` is `"cp"` (centipawns) or `"mate"` (moves to mate); `info.value` is clamped to `[-10000, 10000]`.
 - `best_move`, if present, must be UCI notation (`^[a-h][1-8][a-h][1-8][qrbnQRBN]?$`).
+- `accept_info`, optional, has the same shape as `info`: the evaluation (White's point of view) after the opponent captures the piece this move leaves hanging. Send it only for candidates for a brilliant move; it is used for mate-trap and ignored-threat detection.
 
 **Response** — same shape as the `GET` variant, with `analyze` always populated and a newly generated `share_id`.
 
@@ -450,6 +482,7 @@ Submit client-computed Stockfish results for a specific recent game; the server 
 | `404` | Player or game index not found |
 | `422` | `results` length doesn't match the number of moves in the PGN, or PGN/ratings are malformed |
 | `429` | Analysis capacity temporarily exhausted (see [capacity limits](#rate--capacity-limits)) |
+| `500` | Unexpected failure while saving the analysis |
 
 ---
 
@@ -468,10 +501,12 @@ Classify an arbitrary PGN (not tied to a specific site/player) using client-supp
 }
 ```
 
-- `pgn`: 1 to `MAX_PGN_LENGTH` characters (default cap 200,000).
-- `results`: 1 to `MAX_ANALYSIS_RESULTS` entries (default cap 5,000), same shape as above, one per ply.
-- Supports Chess960 / custom starting positions via `[SetUp "1"]` + `[FEN "..."]` headers; opening detection is skipped for non-standard starting positions.
-- If the PGN includes `[%clk ...]` clock annotations (and ideally a `TimeControl` header), the response also includes per-move `efficiency` (see [Efficiency](#efficiency-who-is-playing-better-right-now)).
+- `pgn`: 1 to `MAX_PGN_LENGTH` characters (default cap 200,000). A PGN that arrives JSON-escaped (literal `\n` and `\"` sequences, optionally wrapped in quotes) is unescaped automatically.
+- `results`: 1 to `MAX_ANALYSIS_RESULTS` entries (default cap 5,000), same shape as above (including optional `accept_info`), one per ply.
+- Supports Chess960 / custom starting positions via `[SetUp "1"]` + `[FEN "..."]` headers; opening detection is skipped for non-standard starting positions. For Chess960, castling is expressed as king-takes-rook in UCI.
+- Unknown or missing ratings (`[WhiteElo "?"]`, `"-"`, empty) are accepted: they count as 0 in the classification Elo adjustment, and as 1500 in the returned `Game`.
+- If the PGN includes `[%clk ...]` clock annotations (and ideally a `TimeControl` header), the response also includes per-move `efficiency` (see [Efficiency](#efficiency-who-is-playing-better-right-now)). Correspondence time controls never produce it.
+- The returned `Game` has `site: "pgn"` and `url: null`; `end_time` comes from `UTCDate`/`UTCTime` (or `Date`/`Time`), falling back to the current time.
 
 **Response**
 
@@ -490,6 +525,7 @@ Classify an arbitrary PGN (not tied to a specific site/player) using client-supp
 |---|---|
 | `422` | `results` length doesn't match PGN move count, or PGN/ratings are malformed |
 | `429` | Analysis capacity temporarily exhausted |
+| `500` | Unexpected failure while analyzing the PGN |
 
 ---
 
@@ -519,8 +555,8 @@ Each entry returned by the analysis endpoints:
 ```
 
 - `evaluation` is either a float in pawns (centipawn score / 100) or a string like `"# 3"` / `"# -0"` for forced mate.
-- `accuracy` is a running average (win%-drop formula) up to and including that move, for the side that just moved.
-- `efficiency` is this move's individual efficiency score (`0`–`100`, see [Efficiency](#efficiency-who-is-playing-better-right-now)), combining move quality and time spent; `null` when the PGN has no clock data for this move.
+- `accuracy` is a running average (win%-drop formula, see [Accuracy](#3-accuracy)) up to and including that move, for the side that just moved; opening-theory moves are not counted.
+- `efficiency` is this move's individual efficiency score (`0`–`100`, see [Efficiency](#efficiency-who-is-playing-better-right-now)), combining move quality and time spent; `null` when the PGN has no clock data for this move, and always `null` for correspondence games.
 - `move_time` / `time_before` are the seconds spent on this move and the clock time available beforehand (from PGN `[%clk ...]` tags, or the time control's base time for the very first move of each side); both `null` without clock data.
 - `eff_white` / `eff_black` are the rolling average of the last 3 efficiency values for White/Black respectively — read together as an "efficiency eval bar" showing who is currently playing better, independent of the raw engine evaluation. Only the field for the side that just moved updates on a given entry; the other carries the previous value forward.
 
@@ -547,14 +583,14 @@ Exchange the admin password for a short-lived bearer token.
 | Status | Meaning |
 |---|---|
 | `401` | Wrong password (generic message, doesn't reveal ban state) |
-| `429` | IP temporarily banned after repeated failed attempts |
+| `429` | IP temporarily banned after repeated failed attempts (same generic message as `401`) |
 | `503` | Admin panel not configured (`ADMIN_PASSWORD` unset) |
 
-Failed logins are rate-limited per IP: 5 failures bans that IP for 30 minutes (both configurable). The failure message is identical whether the password was wrong or the IP is banned, to avoid leaking ban state.
+Failed logins are rate-limited per IP: 5 failures bans that IP for 30 minutes (both configurable). The failure message is identical whether the password was wrong or the IP is banned, to avoid leaking ban state. The client IP is taken from the rightmost `X-Forwarded-For` entry (the one appended by the trusted nginx proxy). If Redis is down the limiter fails open, so an outage cannot lock the admin out. Login attempts are recorded in the request log, so brute-force attempts are visible there.
 
 #### `GET /admin/stats`
 
-Aggregated statistics for a period: request counts, unique visitors, error rate, daily time series, per-endpoint breakdown, analysis cache-hit stats, and top sites/usernames.
+Aggregated statistics for a period: request counts, unique visitors, error rate, time series, per-endpoint breakdown, analysis cache-hit stats, and top sites/usernames.
 
 **Auth:** `Authorization: Bearer <token>` from `/admin/login`.
 
@@ -565,9 +601,18 @@ Aggregated statistics for a period: request counts, unique visitors, error rate,
 | `period` | string \| null | One of `today`, `24h`, `7d`, `30d`, `90d`, `1y` |
 | `days` | int \| null | Deprecated; use `period` instead |
 | `top_endpoints` | string \| null | Comma-separated endpoint route paths to scope the top-sites/usernames breakdown |
-| `visitor` | string \| null | Filter to a single visitor's `ip_hash` |
+| `visitor` | string \| null | Filter the `recent` list to a single visitor's `ip_hash` |
 
 **Response** — [`AdminStatsResponse`](#adminstatsresponse)
+
+Notes on the numbers:
+
+- **Errors** count only `5xx` responses. `4xx` (unknown player, unmatched route, bad payload, rate limit) means the backend worked as intended; the request log still shows every status.
+- **Time series granularity** depends on the period: `today` and `24h` return hourly points (`date` looks like `2026-01-01T12:00`, UTC); `7d` and `30d` return daily points; `90d` returns weekly points and `1y` monthly (30-day) points. `unique_visitors` in merged points is summed visitor-days, consistent with the daily semantics (visitor hashes rotate every day).
+- **Excluded from statistics:** `/ping`, `/health`, `/ready`, and the dashboard's own polling endpoints `/admin/stats` and `/admin/recent`.
+- **`source`** is `bot` for crawler/script user agents, requests without a user agent, and scanner probe paths (`/.env`, `/graphql`, `/aws.json`, …; paths under the API's own prefixes such as `/profile/` are never flagged, so a player named `env` is safe); `frontend` when the request carries the `X-Frontend` header together with an allowed `Origin`/`Referer` (or a same-origin `Sec-Fetch-Site`); `other` otherwise.
+- **`site` / `username`** are parsed from the request path for `/profile`, `/games/page|last`, `/analyze/last` and `/graphs/performance` routes (lowercased).
+- **`error_detail`** holds the response's `detail` text for `status >= 400`, truncated to 1000 characters.
 
 #### `GET /admin/recent`
 
@@ -610,7 +655,7 @@ Simple liveness/readiness probes, excluded from traffic statistics.
 #### `Game`
 ```json
 {
-  "site": "chesscom",
+  "site": "chesscom | pgn",
   "white": { "...": "Player" },
   "black": { "...": "Player" },
   "end_time": "2026-01-01T12:00:00Z",
@@ -619,6 +664,8 @@ Simple liveness/readiness probes, excluded from traffic statistics.
   "url": "https://... | null"
 }
 ```
+
+For games built from a pasted PGN (`POST /analyze/pgn`), `site` is `"pgn"`, `url` is `null` and `time_control` is the raw `TimeControl` header (for example `"600"`).
 
 #### `GamesPage`
 ```json
@@ -699,7 +746,15 @@ Simple liveness/readiness probes, excluded from traffic statistics.
 ```
 
 #### `AnalyzePayload` / `AnalyzeAndPgnPayload`
-See the [POST /analyze/last](#post-analyzelastsiteusernameindex) and [POST /analyze/pgn](#post-analyzepgn) sections above.
+See the [POST /analyze/last](#post-analyzelastsiteusernameindex) and [POST /analyze/pgn](#post-analyzepgn) sections above. Each `results` entry is a `MoveResult`:
+```json
+{
+  "info": { "type": "cp | mate", "value": 0 },
+  "best_move": "e2e4 | null",
+  "accept_info": { "type": "cp | mate", "value": 0 }
+}
+```
+`best_move` and `accept_info` are optional.
 
 #### `AdminLoginResponse`
 ```json
@@ -728,6 +783,10 @@ See the [POST /analyze/last](#post-analyzelastsiteusernameindex) and [POST /anal
   "period": "30d"
 }
 ```
+
+`summary.other` counts every request that is not `frontend` (including bots); `daily[].bots` is the bot share of `requests`. `analysis.local` / `analysis.cache` split analysis requests into freshly computed and served from cache, with their move totals.
+
+`recent` in `/admin/stats` is always empty (`limit=0`); use `/admin/recent` for the paged request log.
 
 #### `RecentRequest`
 ```json
@@ -763,13 +822,16 @@ All errors follow FastAPI's default shape:
 
 or, for request validation errors (`422`), FastAPI's standard field-level error list.
 
+Failures of the upstream chess site are mapped centrally: an upstream `404` becomes `404` ("External resource not found"), an upstream `429` becomes `429` ("External service rate limit exceeded"), any other upstream HTTP error becomes `502`, and a timeout or connection failure becomes `503`.
+
 **Common status codes across endpoints**
 
 | Status | Meaning |
 |---|---|
-| `404` | Player, game, or route not found — also used for unsupported `site` values |
-| `422` | Request validation failed (bad payload shape, mismatched analysis result count, malformed PGN) |
-| `429` | Analysis capacity exhausted, or (admin login only) too many failed attempts |
+| `404` | Player, game, shared snapshot or route not found — also used for unsupported `site` values |
+| `422` | Request validation failed (bad payload shape, mismatched analysis result count, malformed PGN, invalid share ID) |
+| `429` | Analysis capacity exhausted, the upstream chess site is rate-limiting us, or (admin login only) too many failed attempts |
+| `500` | Unexpected failure while saving or computing an analysis |
 | `502` | Upstream chess site request failed |
 | `503` | Upstream chess site unavailable, or admin panel not configured |
 
@@ -786,6 +848,30 @@ These are server-side defaults (all configurable via environment variables) — 
 | `MAX_PGN_LENGTH` | 200,000 chars | Max PGN size accepted by `/analyze/pgn` |
 | `MAX_ANALYSIS_RESULTS` | 5,000 | Max moves accepted per analysis request |
 | `ANALYSIS_CONCURRENCY` | 10 | Concurrent server-side analysis calculations before `429`s start |
+
+**Caching** (see [Caching of upstream data](#caching-of-upstream-data)):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ARCHIVE_CACHE_TTL_SECONDS` | 259,200 (3 days) | Sliding TTL of past-month archives |
+| `ARCHIVE_CURRENT_MONTH_TTL_SECONDS` | 120 | Fixed TTL of the current month's archive |
+| `ARCHIVE_CACHE_NEGATIVE_TTL_SECONDS` | 3,600 | How long an upstream `404` is remembered |
+| `ARCHIVE_LIST_CACHE_TTL_SECONDS` | 600 | TTL of a player's archive list |
+
+**Statistics & admin:**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | — | Statistics database; when empty, request statistics are disabled |
+| `STATS_IP_SALT` | — | Salt for visitor hashes; at least 32 characters are required when `DATABASE_URL` is set, otherwise the app refuses to start |
+| `STATS_RETENTION_DAYS` | 400 | Events older than this are deleted (checked every 6 hours) |
+| `ADMIN_PASSWORD` | — | Admin password; the admin panel is disabled when unset |
+| `ADMIN_SECRET` | derived from the password | HS256 signing key for admin tokens |
+| `ADMIN_TOKEN_TTL_SECONDS` | 86,400 | Admin token lifetime |
+| `ADMIN_MAX_ATTEMPTS` | 5 | Failed logins before an IP is banned |
+| `ADMIN_BAN_SECONDS` | 1,800 | Ban duration |
+| `CORS_ORIGINS` | `chess-stat.ru`, `www.chess-stat.ru`, `localhost:3000` | Comma-separated allowed origins; also used to recognise requests from the frontend |
+| `REDIS_HOST` | `localhost` | Redis host |
 
 More information in the future, as the project develops.
 
@@ -833,22 +919,22 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 - **PostgreSQL** (через `asyncpg`) в продакшене для статистики запросов/трафика, **SQLite** (через `aiosqlite`) как облегчённый бэкенд для тестов — одна и та же кодовая база, драйвер выбирается по `DATABASE_URL`
 - [SQLAlchemy](https://www.sqlalchemy.org/) 2.0 (асинхронный ORM, модели на `DeclarativeBase`)
 - [Alembic](https://alembic.sqlalchemy.org/) для миграций схемы, запускается автоматически при старте контейнера (`entrypoint.sh`)
-- [Redis](https://redis.io/) (через асинхронный клиент `redis-py`) — кэширует вычисленные анализы партий (TTL 3 дня) и обеспечивает rate-limit/бан-лист для логина в админку
+- [Redis](https://redis.io/) (через асинхронный клиент `redis-py`) — кэширует вычисленные анализы партий и share-снимки (TTL 3 дня), кэширует сжатые gzip архивы Chess.com (см. [Кэширование](#кэширование-данных-внешнего-сайта)) и обеспечивает rate-limit/бан-лист для логина в админку
 
 **Шахматная логика**
-- [`python-chess`](https://python-chess.readthedocs.io/) для парсинга PGN, работы с доской/ходами, поддержки Chess960/кастомных FEN
+- [`python-chess`](https://python-chess.readthedocs.io/) для парсинга PGN, работы с доской/ходами, поддержки Chess960/кастомных FEN и статического размена (SEE), используемого при поиске блестящих ходов
 - Движок [Stockfish](https://stockfishchess.org/) (встраивается в Docker-образ при сборке, версия и SHA256 зафиксированы, поддержка amd64/arm64), управляется через Python-обёртку [`stockfish`](https://pypi.org/project/stockfish/) — используется только там, где применим серверный расчёт оценок; основной путь анализа — оценки, присланные клиентом (см. [Концепции](#концепции))
 - Встроенная [база данных дебютов ECO](https://en.wikipedia.org/wiki/Encyclopaedia_of_Chess_Openings) (категории A–E, скачивается при сборке Docker-образа) для определения дебюта
 
 **HTTP и интеграции**
-- [`aiohttp`](https://docs.aiohttp.org/) как асинхронный HTTP-клиент для обращений к Chess.com Published Data API, с ретраями/backoff при временных ошибках (408/425/429/5xx) и типизированными исключениями upstream-ошибок
+- [`aiohttp`](https://docs.aiohttp.org/) как асинхронный HTTP-клиент для обращений к Chess.com Published Data API, с ретраями/backoff при временных ошибках (408/425/429/5xx и таймауты) и типизированными исключениями upstream-ошибок
 - [PyJWT](https://pyjwt.readthedocs.io/) для подписи/проверки bearer-токенов админки (HS256)
 
 **Инфраструктура**
 - Многоэтапная сборка Docker (отдельный этап сборки `stockfish`, затем этап Python-приложения), запуск от непривилегированного пользователя
 - CORS через `CORSMiddleware` из Starlette, разрешённые источники настраиваются через `CORS_ORIGINS`
-- Кастомный `StatsMiddleware` записывает каждый запрос (путь, эндпоинт, статус, длительность, классификация источника, хэш IP, метаданные попадания в кэш/количества ходов) для админ-дашборда, с детекцией ботов/сканеров и фоновым циклом ретеншна, который чистит старые записи
-- Структура построена вокруг `APIRouter` FastAPI по доменам (`profile`, `games`, `graphs`, `analyze`, `admin`), тонкого слоя `services/` и `parsers/`, реализующих интерфейс `BaseParser` для каждого шахматного сайта (сейчас — `chesscom`)
+- Кастомный `StatsMiddleware` записывает каждый запрос (путь, эндпоинт, статус, длительность, классификация источника, хэш IP, метаданные попадания в кэш/количества ходов, усечённое тело ответа для неудачных запросов) для админ-дашборда, с детекцией ботов/сканеров и фоновым циклом ретеншна, который чистит старые записи
+- Структура построена вокруг `APIRouter` FastAPI по доменам (`profile`, `games`, `graphs`, `analyze`, `admin`), тонкого слоя `services/`, `features/` (расчёт перформанс-рейтинга и графиков), `utils/` (HTTP-клиент, клиент Redis, кэш архивов, анализатор, дебюты) и `parsers/`, реализующих интерфейс `BaseParser` для каждого шахматного сайта (сейчас — `chesscom`)
 
 **Тестирование**
 - Встроенный `unittest` Python (с `unittest.mock`) — без зависимости от pytest; асинхронные тесты запускаются через `asyncio.run(...)`
@@ -869,7 +955,7 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 
 Запуск Stockfish — дорогая операция, поэтому этот API **не** запускает шахматный движок сам на каждый запрос. Вместо этого:
 
-1. Клиент (браузер) локально запускает Stockfish по ходам партии и получает одну оценку (`{type, value}`) плюс `best_move` для каждого полухода.
+1. Клиент (браузер) локально запускает Stockfish по ходам партии и получает одну оценку (`{type, value}`) плюс `best_move` для каждого полухода. Для ходов, похожих на возможные блестящие (жертва), клиент может дополнительно прислать `accept_info` — оценку после того, как соперник забирает фигуру, оставленную ходом под боем.
 2. Клиент отправляет эти готовые результаты в `POST /analyze/pgn` или `POST /analyze/last/{site}/{username}/{index}`.
 3. Сервер превращает сырые оценки в **классификации** ходов (best / excellent / good / inaccuracy / mistake / blunder / great / brilliant / miss / theory, плюс собственная система классификации chess-stat.ru — `chess_stat`), рассчитывает **accuracy** (точность), показатель **efficiency** (эффективность, см. ниже) и определяет **дебют** — и кэширует результат в Redis для эндпоинтов анализа партий.
 
@@ -878,11 +964,13 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 Для каждого хода возвращаются два параллельных классификатора в `move_classify`:
 
 - `chesscom` — повторяет словарь классификации Chess.com (`best`, `excellent`, `good`, `inaccuracy`, `mistake`, `blunder`, `great`, `brilliant`, `miss`, `theoretical`), пороги скорректированы по рейтингу (elo), есть детекция жертв/блестящих ходов.
-- `chess_stat` — **собственная система классификации chess-stat.ru** (`advance`, `steady`, `retreat`, `miss`, `theory`). Там, где девятиуровневая шкала Chess.com может усложнить оценку того, насколько ход действительно повлиял на партию, `chess_stat` сознательно сводит качество хода к трём понятным категориям: хорошие ходы (`advance`), ходы, слегка неоптимальные, но не вредящие позиции — существовал лучший ход (`steady`), и по-настоящему плохие ходы (`retreat`). `miss` стоит отдельно от этих категорий — это упущенная возможность: соперник только что допустил ошибку, давшую значительное преимущество, а игрок им не воспользовался. `theory` — для известных дебютных ходов. Цель — дать игроку возможность сразу увидеть, в какой именно момент партии его ход мысли дал сбой, вместо того чтобы теряться в тонких различиях между почти равноценными по качеству ходами.
+- `chess_stat` — **собственная система классификации chess-stat.ru** (`advance`, `steady`, `retreat`, `miss`, `theory`). Там, где девятиуровневая шкала Chess.com может усложнить оценку того, насколько ход действительно повлиял на партию, `chess_stat` сознательно сводит качество хода к трём понятным категориям: хорошие ходы (`advance`), ходы, слегка неоптимальные, но не вредящие позиции — существовал лучший ход (`steady`), и по-настоящему плохие ходы (`retreat`). `miss` стоит отдельно от этих категорий — это упущенная возможность: соперник только что допустил ошибку, давшую значительное преимущество (или форсированный мат), а игрок им не воспользовался. `theory` — для известных дебютных ходов. Цель — дать игроку возможность сразу увидеть, в какой именно момент партии его ход мысли дал сбой, вместо того чтобы теряться в тонких различиях между почти равноценными по качеству ходами.
+
+У обоих классификаторов есть два общих переопределения для ходов, не совпадающих с лучшим ходом движка: ход, **упустивший** возможность, получает `miss`, а ход, **допускающий форсированный мат** (после него у соперника появляется мат, которого раньше не было), получает `retreat` (`chess_stat`) / `blunder` (`chesscom`). Точные условия — в разделе [Пороги классификации](#6-пороги-классификации).
 
 ### Определение дебюта
 
-Начальная последовательность ходов партии сопоставляется с базой дебютов ECO (категории A–E), чтобы определить название дебюта и пометить ходы «theory», совпадающие с известными дебютными линиями.
+Начальная последовательность ходов партии сопоставляется с базой дебютов ECO (категории A–E), чтобы определить название дебюта и пометить ходы «theory», совпадающие с известными дебютными линиями. Для партий с нестандартной начальной позицией (Chess960, кастомный FEN) определение дебюта пропускается.
 
 ### Efficiency: кто на самом деле сильнее играет *прямо сейчас*
 
@@ -896,6 +984,14 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 Эти факторы объединяются в единый показатель по каждому ходу в диапазоне `[0, 100]`, а затем сглаживаются в `eff_white` / `eff_black`: скользящее среднее по последним **3** ходам каждой стороны (`EFF_WINDOW_PER_SIDE`), чтобы число отражало *текущую форму игрока в позиции*, а не один случайный удачный или неудачный ход. `efficiency` требует наличия часов в PGN (аннотации `[%clk ...]`); без данных о часах он — и `eff_white`/`eff_black` — равны `null`.
 
 **Как читать это в виде eval-бара:** если построить `eff_white` относительно `eff_black` по ходу партии, получится второй бар рядом с баром оценки движка. Бар движка говорит, кто сейчас впереди по позиции; бар эффективности — кто сейчас под давлением. Показательная картина: белые проигрывают по оценке движка, но чёрные — хоть и стоят лучше — тратят очень много времени на каждый ход (позиция сложная, чёрные ещё не чувствуют выигрыша), в то время как белые отвечают быстро и точно. Здесь эффективность белых выше эффективности чёрных, даже если оценка белых ниже — это сигнал, что чёрные с большей вероятностью ошибутся по ходу дальнейшей партии, и у белых есть реальный практический шанс вернуться в выигрышную (или как минимум равную) позицию.
+
+### Кэширование данных внешнего сайта
+
+Месячные архивы Chess.com и списки архивов кэшируются в Redis в виде сжатого gzip JSON, чтобы повторные запросы профиля, партий, графиков и анализа не обращались к API Chess.com снова:
+
+- **Прошедшие месяцы** на Chess.com неизменяемы, поэтому для них используется скользящий TTL (по умолчанию 3 дня), который продлевается при каждом чтении.
+- **Текущий месяц** получает короткий фиксированный TTL (по умолчанию 120 с) без продления.
+- **Список архивов** имеет фиксированный TTL (по умолчанию 10 минут).
 
 ---
 
@@ -913,15 +1009,15 @@ Backend API для [chess-stat.ru](https://chess-stat.ru) — статистик
 
 $$
 w(s) = \frac{1}{1 + 10^{-s / 4}}, \qquad
-w_{\text{mate}}(m) = \begin{cases} 1.0, & m > 0 \\ 0.0, & m \le 0 \end{cases}
+w_{\text{mate}}(m) = \begin{cases} 1.0, & m > 0 \ \text{или}\ m = 0 \ \text{и чёрным поставлен мат} \\ 0.0, & \text{иначе} \end{cases}
 $$
 
 Проще говоря: 
 - $s = 0 \Rightarrow w = 0{,}5$ (равно)
 - $s = +1 \Rightarrow w \approx 0{,}64$
 - $s = +2 \Rightarrow w \approx 0{,}76$. 
-- Белые могут **поставить** мат в $m$ ходов — $1$
-- Белые могут **получить** мат в $m$ ходов — $0$.
+- Белые могут **поставить** мат в $m$ ходов (или мат только что поставлен) — $1$
+- Белые могут **получить** мат в $m$ ходов (или им только что поставлен мат) — $0$.
 
 ### 2. Колебание оценки $\Delta w$ (`diff_expected`)
 
@@ -964,19 +1060,23 @@ $$
 - $D = 10 \Rightarrow acc_i \approx 34{,}8$ 
 - $D = 20 \Rightarrow acc_i \approx 10{,}8$
 
+Оценки с матом попадают в формулу как очень большие значения в сантипешках, поэтому win-процент насыщается у 0/100, и «мат против мата» ошибкой не считается. Первый ход партии из кастомной начальной позиции не имеет предыдущей оценки и получает 100.
+
+**Точность стороны.** Значение `accuracy`, прикрепляемое к каждому ходу, — обычное среднее арифметическое точностей ходов той стороны, которая только что сходила, по всем её ходам до этого момента. Дебютные («theory») ходы в среднее не входят, а у стороны, у которой ещё нет учтённых ходов, точность равна 100. Штрафов или весов за длину партии нет.
+
 Фундамент идеи основан на этой [статье](https://lichess.org/forum/team-zNAEJBNN/RxgX6G2C) которая посвящена метрике точности на Lichess
 
 ### 4. Эффективность (efficiency)
 
 Собственная иновационная идея метрики которая позволяет оценивать позицию более *человеческим* взглядом. Собирая оценку движка и потраченное время в одну формулу, мы можем увидеть насколько комфортно себя чувствует игрок в этой позиции: движок может оценивать позицию как выигрышную для белых, но если игрок белых тратит очень много времени на поиск верных ходов, то можно ли сказать что позиция комфортна для него и по *человечески* выигрышна? Думаю что скорее нет, чем да. Для решения этой проблемы и была создана метрика эффективности, которая показывает кто играет "лучше" последние несколько ходов, по совместительству предсказывая в каком направлении, вероятно, развернется партия в будущем.
 
-Требуются часы в PGN, иначе расчитать метрику возможности не будет.
+Требуются часы в PGN, иначе расчитать метрику возможности не будет. Партии по переписке (`daily`) исключены полностью.
 
 $$
 t_{move} = \max\bigl(0,\ t_{before} - t_{after} + inc\bigr)
 $$
 
-$t_{before}$ — время ходившего до хода (предыдущие часы того же цвета, либо базовое время из заголовка `TimeControl` для первого хода каждой стороны), $t_{after}$ — часы после, $inc$ — инкремент в секундах.
+$t_{before}$ — время ходившего до хода (предыдущие часы того же цвета, либо базовое время из заголовка `TimeControl` для первого хода каждой стороны; если в заголовке нет пригодного базового времени, у первого хода каждой стороны эффективности нет), $t_{after}$ — часы после, $inc$ — инкремент в секундах.
 
 $$
 f = \min\!\left(\frac{t_{move}}{t_{before}},\ 2{,}0\right), \qquad
@@ -1006,30 +1106,47 @@ $$
 
 ### 6. Пороги классификации
 
-**`chess_stat`** (своя система):
+**`chess_stat`** (своя система). Базовый класс по $\Delta w$:
 
 | Класс | Условие |
 |---|---|
 | `advance` | сыгран лучший ход по версии движка или $\Delta w \le 0{,}04$ |
 | `steady` | $\Delta w \le 0{,}12$ |
-| `miss` | $\Delta w \ge 0{,}09$ **И** предыдущий ход имел $\Delta w_{prev} > 0{,}12$ (соперник только что зевнул, а вы не наказали) |
-| `retreat` | иначе (большой $\Delta w$ без контекста `miss`) |
-| `theory` | ход из дебютной книги |
+| `retreat` | больший $\Delta w$ |
+| `miss` | ход не воспользовался ошибкой соперника (см. [Miss](#miss-упущенная-возможность)) |
+| `theory` | ход из дебютной книги (приоритетнее всего) |
 
 **`chesscom`** (словарь Chess.com, Elo-поправка; $bonus = \frac{4000 - Elo}{4000} \cdot 0{,}05$ — слабым игрокам "хорошие" окна чуть шире):
 
-| Класс | Условие на $\Delta w$ |
+| Класс | Условие |
 |---|---|
 | `best` | сыгран `best_move` или $\Delta w = 0$ |
 | `excellent` | $\Delta w \le 0{,}02 + bonus$ |
 | `good` | $\Delta w \le 0{,}05 + bonus$ |
 | `inaccuracy` | $\Delta w \le 0{,}10 + bonus$ |
 | `mistake` | $\Delta w \le 0{,}20 + bonus$ |
-| `blunder` | больше |
+| `blunder` | больший $\Delta w$ |
 | `great` | `best` + скачок оценки по сравнению с твоим прошлым ходом $> (100 + Elo/40)$ сантипешек в твою пользу |
-| `brilliant` | `best` + жертва материала (SEE-подобная цепочка взятий $< 0$, атакующая фигура дороже взятой), сохранившая/увеличившая перевес |
-| `miss` | `blunder` сразу после `blunder` соперника (не наказал соперника за его ошибку, текущий `blunder` скорее говорит о том что позиция вернулась к "исходному" положению) |
+| `brilliant` | жертва, сохраняющая позицию (см. [Блестящие ходы](#блестящие-ходы)); не обязан быть первой линией движка |
+| `miss` | не лучший ход, не воспользовавшийся ошибкой соперника (см. [Miss](#miss-упущенная-возможность)) |
 | `theoretical` | ход из дебютной книги |
+
+#### Miss (упущенная возможность)
+
+Ход, не являющийся лучшим ходом движка, получает `miss` в одном из двух случаев:
+
+- **Упущенное преимущество.** Пусть $b$ — ожидаемый счёт ходящего до последнего хода соперника, $o$ — после него, $a$ — после собственного хода ходящего (всё с точки зрения ходящего). Это miss, если ход соперника поднял счёт ходящего не менее чем на $0{,}10$ и до значения не ниже $0{,}60$ ($o - b \ge 0{,}10$, $o \ge 0{,}60$), но ответ ходящего вернул его примерно туда, откуда всё началось: $b - a < 0{,}10$ и $a \le b + 0{,}03$. Для кастомной начальной позиции не определяется (нет базовой оценки).
+- **Упущенный мат.** На предыдущем полуходе у ходящего был форсированный мат, ответом мат не сохранён, при этом ходящий всё ещё стоит на $\ge 0{,}60$ ожидаемого счёта.
+
+#### Блестящие ходы
+
+Ход считается `brilliant`, если он не дебютный и выполняется всё перечисленное (значения в сантипешках — с точки зрения ходящего; шкала ожидаемого счёта здесь — эло-подобная $1/(1+10^{-cp/400})$):
+
+- в позиции не менее 3 легальных ходов (5 — если стоит шах);
+- ход отдаёт не более $0{,}12$ ожидаемого счёта по сравнению с оценкой до него и не теряет и не отдаляет уже имеющийся форсированный мат;
+- позиция после хода для ходящего не хуже $-100$ сантипешек;
+- если ходящий уже выигрывал (больше $+500$ сантипешек без форсированного мата), засчитывается только жертва-«ловушка с матом» — `accept_info` показывает, что взятие предложенной фигуры позволяет ходящему поставить мат, — и ход должен рисковать не менее чем 200 сантипешками материала;
+- в остальных случаях ход подходит, если он **создаёт новую висящую фигуру** стоимостью не менее 200 сантипешек за вычетом взятого материала (статический размен) — за исключением тихого хода (без взятия и шаха) при оценке в зоне $+400…+500$ сантипешек, который так жертвой не считается, — либо в любом случае, если он **игнорирует угрозу**: `accept_info` показывает, что принятие предложенного материала даёт сопернику не менее 600 сантипешек (или мат), ход рискует не менее чем 200 сантипешками, и существовал нежертвенный альтернативный ход.
 
 ---
 
@@ -1085,11 +1202,11 @@ $$
 | Имя | Тип | По умолчанию | Ограничения | Описание |
 |---|---|---|---|---|
 | `limit` | int | `10` | `1 ≤ limit ≤ MAX_PAGE_SIZE` (по умолчанию максимум 50) | Партий на странице |
-| `offset` | int | `0` | `0 ≤ offset ≤ MAX_PAGE_OFFSET` | Сколько партий пропустить |
+| `offset` | int | `0` | `0 ≤ offset ≤ MAX_PAGE_OFFSET` (`MAX_GAMES − 10`) | Сколько партий пропустить |
 
 **Ответ** — [`GamesPage`](#gamespage-1)
 
-`total_pages` известен (и заполнен) только после достижения последней страницы; до этого — `null`, а `has_more` — `true`, поскольку бэкенд никогда не сканирует весь архив игрока только ради подсчёта партий.
+`total_pages` известен (и заполнен) только после достижения последней страницы; до этого — `null`, а `has_more` — `true`, поскольку бэкенд никогда не сканирует весь архив игрока только ради подсчёта партий. Пагинация ограничена `MAX_GAMES`: страница, дошедшая до этой глубины, считается последней.
 
 **Ошибки:** `404`, если игрок не найден.
 
@@ -1101,7 +1218,7 @@ $$
 
 #### `GET /graphs/performance/{site}/{username}/{days}`
 
-Точки рейтинга/перформанса за период, сгруппированные по дням (при `days < 30`) или примерно по `days / 30` группам в остальных случаях.
+Точки рейтинга/перформанса за период, сгруппированные по дням (при `days < 30`) или примерно по `days / 30` дней в группе в остальных случаях. Границы групп выровнены по 03:00 UTC. Если в группе нет партий, повторяются `value` и `rating` предыдущей точки с `games: 0`.
 
 **Параметры пути**
 
@@ -1168,7 +1285,7 @@ $$
 }
 ```
 
-`profiles` содержит компактные карточки игроков прямо в ответе анализа, поэтому клиенту не нужны отдельные запросы профиля. Если анализ уже закэширован, `share_id` можно использовать для получения того же snapshot через [`GET /analyze/shared/{share_id}`](#get-analyzesharedshare_id).
+`profiles` содержит компактные карточки игроков прямо в ответе анализа, поэтому клиенту не нужны отдельные запросы профиля; они загружаются по принципу best-effort, и сторона, карточку которой загрузить не удалось, возвращается как `null`. Если анализ уже закэширован, `share_id` можно использовать для получения того же snapshot через [`GET /analyze/shared/{share_id}`](#get-analyzesharedshare_id) — если для закэшированного анализа ещё нет живого snapshot, он создаётся при этом вызове.
 
 **Ошибки:** `404`, если игрок или партия с таким индексом не найдены.
 
@@ -1176,7 +1293,7 @@ $$
 
 #### `GET /analyze/shared/{share_id}`
 
-Получить ранее созданный snapshot анализа по share ID. Snapshot хранится в Redis с тем же TTL в 3 дня, что и обычный кэш анализа партий.
+Получить ранее созданный snapshot анализа по share ID. Snapshot хранится в Redis с тем же TTL в 3 дня, что и обычный кэш анализа партий. Snapshot, созданные до появления встроенных карточек игроков, возвращают `null` в `profiles`.
 
 **Параметры пути**
 
@@ -1198,13 +1315,13 @@ $$
 }
 ```
 
-**Ошибки:** `404`, если share ID некорректен, истёк или не найден; `422`, если формат share ID некорректен.
+**Ошибки:** `404`, если share ID не найден или истёк; `422`, если формат share ID некорректен.
 
 ---
 
 #### `POST /analyze/last/{site}/{username}/{index}`
 
-Отправить результаты Stockfish, вычисленные на клиенте, для конкретной недавней партии; сервер рассчитывает классификации, кэширует их (TTL 3 дня) и возвращает.
+Отправить результаты Stockfish, вычисленные на клиенте, для конкретной недавней партии; сервер рассчитывает классификации, кэширует их (TTL 3 дня) и возвращает. Каждый вызов создаёт новый `share_id`; ссылки от предыдущих вызовов продолжают работать до истечения срока.
 
 **Параметры пути:** те же, что и в варианте `GET` выше.
 
@@ -1222,6 +1339,7 @@ $$
 - `results` должен содержать ровно по одному элементу на каждый полуход в PGN партии.
 - `info.type` — `"cp"` (сантипешки) или `"mate"` (число ходов до мата); `info.value` ограничен диапазоном `[-10000, 10000]`.
 - `best_move`, если указан, должен быть в нотации UCI (`^[a-h][1-8][a-h][1-8][qrbnQRBN]?$`).
+- `accept_info`, опционален, той же формы, что и `info`: оценка (с точки зрения белых) после того, как соперник забирает фигуру, оставленную этим ходом под боем. Отправляйте только для кандидатов в блестящие ходы; используется для поиска ловушек с матом и проигнорированных угроз.
 
 **Ответ** — такая же форма, как у варианта `GET`, но `analyze` всегда заполнен и возвращается новый `share_id`.
 
@@ -1232,6 +1350,7 @@ $$
 | `404` | Игрок или партия с таким индексом не найдены |
 | `422` | Длина `results` не совпадает с количеством ходов в PGN, либо PGN/рейтинги некорректны |
 | `429` | Ёмкость для анализа временно исчерпана (см. [лимиты ёмкости](#лимиты-скорости-и-ёмкости)) |
+| `500` | Непредвиденный сбой при сохранении анализа |
 
 ---
 
@@ -1250,10 +1369,12 @@ $$
 }
 ```
 
-- `pgn`: от 1 до `MAX_PGN_LENGTH` символов (по умолчанию максимум 200 000).
-- `results`: от 1 до `MAX_ANALYSIS_RESULTS` элементов (по умолчанию максимум 5000), та же форма, что и выше, по одному на полуход.
-- Поддерживает Chess960 / кастомные начальные позиции через заголовки `[SetUp "1"]` + `[FEN "..."]`; определение дебюта пропускается для нестандартных начальных позиций.
-- Если PGN содержит аннотации часов `[%clk ...]` (и в идеале заголовок `TimeControl`), в ответе также присутствует показатель `efficiency` для каждого хода (см. [Efficiency](#efficiency-кто-на-самом-деле-сильнее-играет-прямо-сейчас)).
+- `pgn`: от 1 до `MAX_PGN_LENGTH` символов (по умолчанию максимум 200 000). PGN, пришедший в JSON-экранированном виде (буквальные последовательности `\n` и `\"`, возможно обёрнутый в кавычки), автоматически разэкранируется.
+- `results`: от 1 до `MAX_ANALYSIS_RESULTS` элементов (по умолчанию максимум 5000), та же форма, что и выше (включая опциональный `accept_info`), по одному на полуход.
+- Поддерживает Chess960 / кастомные начальные позиции через заголовки `[SetUp "1"]` + `[FEN "..."]`; определение дебюта пропускается для нестандартных начальных позиций. В Chess960 рокировка в UCI записывается как «король берёт ладью».
+- Неизвестные или отсутствующие рейтинги (`[WhiteElo "?"]`, `"-"`, пустая строка) допускаются: в поправке Elo при классификации они считаются как 0, а в возвращаемом `Game` — как 1500.
+- Если PGN содержит аннотации часов `[%clk ...]` (и в идеале заголовок `TimeControl`), в ответе также присутствует показатель `efficiency` для каждого хода (см. [Efficiency](#efficiency-кто-на-самом-деле-сильнее-играет-прямо-сейчас)). Для контролей по переписке он не считается никогда.
+- Возвращаемый `Game` имеет `site: "pgn"` и `url: null`; `end_time` берётся из `UTCDate`/`UTCTime` (или `Date`/`Time`), иначе — текущее время.
 
 **Ответ**
 
@@ -1272,6 +1393,7 @@ $$
 |---|---|
 | `422` | Длина `results` не совпадает с количеством ходов в PGN, либо PGN/рейтинги некорректны |
 | `429` | Ёмкость для анализа временно исчерпана |
+| `500` | Непредвиденный сбой при анализе PGN |
 
 ---
 
@@ -1301,8 +1423,8 @@ $$
 ```
 
 - `evaluation` — либо число в пешках (сантипешечная оценка / 100), либо строка вида `"# 3"` / `"# -0"` для форсированного мата.
-- `accuracy` — накопительное среднее (формула просадки win-процентов) до этого хода включительно, для стороны, только что сходившей.
-- `efficiency` — показатель эффективности отдельного хода (`0`–`100`, см. [Efficiency](#efficiency-кто-на-самом-деле-сильнее-играет-прямо-сейчас)), объединяющий качество хода и затраченное на него время; `null`, если для этого хода в PGN нет данных о часах.
+- `accuracy` — накопительное среднее (формула просадки win-процентов, см. [Точность](#3-точность-accuracy)) до этого хода включительно, для стороны, только что сходившей; дебютные ходы не учитываются.
+- `efficiency` — показатель эффективности отдельного хода (`0`–`100`, см. [Efficiency](#efficiency-кто-на-самом-деле-сильнее-играет-прямо-сейчас)), объединяющий качество хода и затраченное на него время; `null`, если для этого хода в PGN нет данных о часах, и всегда `null` для партий по переписке.
 - `move_time` / `time_before` — сколько секунд потрачено на ход и сколько времени было на часах до него (из тегов `[%clk ...]` PGN, либо базовое время контроля для самого первого хода каждой стороны); оба `null` без данных о часах.
 - `eff_white` / `eff_black` — скользящее среднее последних 3 значений эффективности для белых/чёрных соответственно — читаются вместе как «eval-бар эффективности», показывающий, кто сейчас играет сильнее, независимо от сырой оценки движка. В каждой записи обновляется только поле стороны, которая только что сходила; второе несёт предыдущее значение дальше.
 
@@ -1329,14 +1451,14 @@ $$
 | Статус | Значение |
 |---|---|
 | `401` | Неверный пароль (общее сообщение, не раскрывает статус бана) |
-| `429` | IP временно забанен после множества неудачных попыток |
+| `429` | IP временно забанен после множества неудачных попыток (то же общее сообщение, что и при `401`) |
 | `503` | Админ-панель не настроена (`ADMIN_PASSWORD` не задан) |
 
-Неудачные попытки входа ограничиваются по IP: 5 неудач банят IP на 30 минут (оба значения настраиваются). Сообщение об ошибке одинаково и при неверном пароле, и при активном бане — чтобы не раскрывать статус бана.
+Неудачные попытки входа ограничиваются по IP: 5 неудач банят IP на 30 минут (оба значения настраиваются). Сообщение об ошибке одинаково и при неверном пароле, и при активном бане — чтобы не раскрывать статус бана. IP клиента берётся из крайней правой записи `X-Forwarded-For` (её добавляет доверенный nginx). Если Redis недоступен, ограничитель пропускает запросы (fail open), чтобы сбой не заблокировал администратора. Попытки входа записываются в лог запросов, поэтому перебор пароля там виден.
 
 #### `GET /admin/stats`
 
-Агрегированная статистика за период: количество запросов, уникальные посетители, доля ошибок, дневной временной ряд, разбивка по эндпоинтам, статистика попаданий в кэш анализа и топ сайтов/пользователей.
+Агрегированная статистика за период: количество запросов, уникальные посетители, доля ошибок, временной ряд, разбивка по эндпоинтам, статистика попаданий в кэш анализа и топ сайтов/пользователей.
 
 **Авторизация:** `Authorization: Bearer <token>`, полученный из `/admin/login`.
 
@@ -1347,9 +1469,18 @@ $$
 | `period` | string \| null | Один из `today`, `24h`, `7d`, `30d`, `90d`, `1y` |
 | `days` | int \| null | Устарел; используйте `period` |
 | `top_endpoints` | string \| null | Пути эндпоинтов через запятую, ограничивающие разбивку топ сайтов/пользователей |
-| `visitor` | string \| null | Фильтр по `ip_hash` конкретного посетителя |
+| `visitor` | string \| null | Фильтр списка `recent` по `ip_hash` конкретного посетителя |
 
 **Ответ** — [`AdminStatsResponse`](#adminstatsresponse-1)
+
+Пояснения к цифрам:
+
+- **Ошибками** считаются только ответы `5xx`. `4xx` (неизвестный игрок, несуществующий маршрут, неверный payload, rate limit) означает, что бэкенд отработал как задумано; в логе запросов по-прежнему виден каждый статус.
+- **Гранулярность временного ряда** зависит от периода: `today` и `24h` возвращают почасовые точки (`date` вида `2026-01-01T12:00`, UTC); `7d` и `30d` — дневные; `90d` — недельные, `1y` — месячные (по 30 дней). `unique_visitors` в объединённых точках — сумма посетителей-дней, в соответствии с дневной семантикой (хэши посетителей меняются каждый день).
+- **Исключены из статистики:** `/ping`, `/health`, `/ready`, а также собственные запросы дашборда `/admin/stats` и `/admin/recent`.
+- **`source`** равен `bot` для user-agent краулеров/скриптов, запросов без user-agent и путей-проб сканеров (`/.env`, `/graphql`, `/aws.json`, …; пути под собственными префиксами API, например `/profile/`, никогда не помечаются, поэтому игрок с ником `env` не страдает); `frontend` — когда запрос содержит заголовок `X-Frontend` вместе с разрешённым `Origin`/`Referer` (либо same-origin `Sec-Fetch-Site`); иначе `other`.
+- **`site` / `username`** разбираются из пути запроса для маршрутов `/profile`, `/games/page|last`, `/analyze/last` и `/graphs/performance` (в нижнем регистре).
+- **`error_detail`** содержит текст `detail` ответа при `status >= 400`, усечённый до 1000 символов.
 
 #### `GET /admin/recent`
 
@@ -1392,7 +1523,7 @@ $$
 #### `Game`
 ```json
 {
-  "site": "chesscom",
+  "site": "chesscom | pgn",
   "white": { "...": "Player" },
   "black": { "...": "Player" },
   "end_time": "2026-01-01T12:00:00Z",
@@ -1401,6 +1532,8 @@ $$
   "url": "https://... | null"
 }
 ```
+
+Для партий, построенных из вставленного PGN (`POST /analyze/pgn`), `site` равен `"pgn"`, `url` — `null`, а `time_control` — сырой заголовок `TimeControl` (например, `"600"`).
 
 #### `GamesPage`
 ```json
@@ -1481,7 +1614,15 @@ $$
 ```
 
 #### `AnalyzePayload` / `AnalyzeAndPgnPayload`
-См. разделы [POST /analyze/last](#post-analyzelastsiteusernameindex-1) и [POST /analyze/pgn](#post-analyzepgn-1) выше.
+См. разделы [POST /analyze/last](#post-analyzelastsiteusernameindex-1) и [POST /analyze/pgn](#post-analyzepgn-1) выше. Каждый элемент `results` — это `MoveResult`:
+```json
+{
+  "info": { "type": "cp | mate", "value": 0 },
+  "best_move": "e2e4 | null",
+  "accept_info": { "type": "cp | mate", "value": 0 }
+}
+```
+`best_move` и `accept_info` опциональны.
 
 #### `AdminLoginResponse`
 ```json
@@ -1510,6 +1651,10 @@ $$
   "period": "30d"
 }
 ```
+
+`summary.other` — все запросы, кроме `frontend` (включая ботов); `daily[].bots` — доля ботов внутри `requests`. `analysis.local` / `analysis.cache` делят запросы анализа на посчитанные заново и отданные из кэша, с суммами ходов.
+
+Поле `recent` в `/admin/stats` всегда пустое (`limit=0`); постраничный лог запросов — в `/admin/recent`.
 
 #### `RecentRequest`
 ```json
@@ -1545,13 +1690,16 @@ $$
 
 или, для ошибок валидации запроса (`422`) — стандартному постатейному списку ошибок FastAPI.
 
+Сбои внешнего шахматного сайта обрабатываются централизованно: `404` от внешнего сайта превращается в `404` («External resource not found»), `429` — в `429` («External service rate limit exceeded»), любая другая HTTP-ошибка внешнего сайта — в `502`, а таймаут или обрыв соединения — в `503`.
+
 **Общие коды статусов для всех эндпоинтов**
 
 | Статус | Значение |
 |---|---|
-| `404` | Игрок, партия или маршрут не найдены — также используется для неподдерживаемых значений `site` |
-| `422` | Валидация запроса не прошла (некорректная форма payload, несовпадение количества результатов анализа, некорректный PGN) |
-| `429` | Ёмкость анализа исчерпана, либо (только для логина в админку) слишком много неудачных попыток |
+| `404` | Игрок, партия, share-snapshot или маршрут не найдены — также используется для неподдерживаемых значений `site` |
+| `422` | Валидация запроса не прошла (некорректная форма payload, несовпадение количества результатов анализа, некорректный PGN, неверный share ID) |
+| `429` | Ёмкость анализа исчерпана, внешний шахматный сайт ограничивает нас по частоте, либо (только для логина в админку) слишком много неудачных попыток |
+| `500` | Непредвиденный сбой при сохранении или расчёте анализа |
 | `502` | Запрос к внешнему шахматному сайту не удался |
 | `503` | Внешний шахматный сайт недоступен, либо админ-панель не настроена |
 
@@ -1568,5 +1716,29 @@ $$
 | `MAX_PGN_LENGTH` | 200 000 символов | Максимальный размер PGN, принимаемый `/analyze/pgn` |
 | `MAX_ANALYSIS_RESULTS` | 5 000 | Максимум ходов, принимаемых в одном запросе анализа |
 | `ANALYSIS_CONCURRENCY` | 10 | Количество параллельных серверных расчётов анализа до появления `429` |
+
+**Кэширование** (см. [Кэширование данных внешнего сайта](#кэширование-данных-внешнего-сайта)):
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `ARCHIVE_CACHE_TTL_SECONDS` | 259 200 (3 дня) | Скользящий TTL архивов прошедших месяцев |
+| `ARCHIVE_CURRENT_MONTH_TTL_SECONDS` | 120 | Фиксированный TTL архива текущего месяца |
+| `ARCHIVE_CACHE_NEGATIVE_TTL_SECONDS` | 3 600 | Сколько помнится `404` от внешнего сайта |
+| `ARCHIVE_LIST_CACHE_TTL_SECONDS` | 600 | TTL списка архивов игрока |
+
+**Статистика и админка:**
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `DATABASE_URL` | — | База статистики; если пусто, сбор статистики запросов отключён |
+| `STATS_IP_SALT` | — | Соль для хэшей посетителей; при заданном `DATABASE_URL` нужно минимум 32 символа, иначе приложение не запустится |
+| `STATS_RETENTION_DAYS` | 400 | События старше этого срока удаляются (проверка каждые 6 часов) |
+| `ADMIN_PASSWORD` | — | Пароль администратора; без него админ-панель отключена |
+| `ADMIN_SECRET` | выводится из пароля | Ключ подписи (HS256) токенов админки |
+| `ADMIN_TOKEN_TTL_SECONDS` | 86 400 | Время жизни токена админки |
+| `ADMIN_MAX_ATTEMPTS` | 5 | Число неудачных входов до бана IP |
+| `ADMIN_BAN_SECONDS` | 1 800 | Длительность бана |
+| `CORS_ORIGINS` | `chess-stat.ru`, `www.chess-stat.ru`, `localhost:3000` | Разрешённые источники через запятую; также используется для распознавания запросов фронтенда |
+| `REDIS_HOST` | `localhost` | Хост Redis |
 
 Больше информации появится по мере развития проекта.
